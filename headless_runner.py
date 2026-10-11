@@ -174,14 +174,20 @@ def run_batch(
     task_id: Optional[str] = None,
     run_task: Optional[Callable[..., pr.RunResult]] = None,
     clock: Callable[[], float] = time.monotonic,
+    now: Optional[datetime] = None,
 ) -> BatchOutcome:
     """Process queued tasks. With task_id set, runs exactly that one task.
+
+    Automatic selection only picks tasks for the current month (task id
+    prefix f<N>, N = months since MONTH_BASE_YEAR); ids without that prefix
+    stay eligible. When only future-month tasks remain, the batch stops.
 
     Must run while holding the runs/.flowforge.lock flock (run-task.py does):
     it converts stale 'running' tasks (dead-process leftovers) to 'failed'.
     """
     run_one = run_task or pr.run_selected_task
     single = task_id is not None
+    max_month = None if single else pr.current_month_number(now)
     started = clock()
     outcomes: List[TaskOutcome] = []
     reason = "queue_empty"
@@ -220,11 +226,14 @@ def run_batch(
         except (FileNotFoundError, ValueError) as exc:
             raise ValueError(f"Cannot read tasks file {pr.TASKS_FILE}: {exc}") from exc
 
-        idx = pr.find_task_index(tasks, task_id) if single else pr.find_next_todo(tasks)
+        idx = pr.find_task_index(tasks, task_id) if single else pr.find_next_todo(tasks, max_month)
         if idx is None:
             if single:
                 raise ValueError(f"Task id not found: {task_id}")
-            reason = "queue_empty"
+            if any(t.get("status", "todo") == "todo" for t in tasks):
+                reason = "month_gated"
+            else:
+                reason = "queue_empty"
             break
 
         task = tasks[idx]
@@ -299,6 +308,23 @@ def run_batch(
                 "completed": sum(1 for o in outcomes if o.ok),
                 "failed": sum(1 for o in outcomes if not o.ok),
                 "duration_sec": duration,
+            }
+        )
+    elif reason == "month_gated":
+        held = sum(1 for t in tasks if t.get("status", "todo") == "todo")
+        message = (
+            f"No active tasks for month f{max_month}; {held} future task(s) on hold."
+        )
+        print(message)
+        logger.info("Month gate: stopping (%s)", message)
+        notifier.run_completed(
+            {
+                "results": [],
+                "completed": 0,
+                "failed": 0,
+                "duration_sec": duration,
+                "reason": reason,
+                "message": message,
             }
         )
     elif reason == "queue_empty":

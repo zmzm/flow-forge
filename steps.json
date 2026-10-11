@@ -3,17 +3,20 @@
     {
       "id": "concept",
       "label": "Business plan",
-      "agent": "concept-plan"
+      "agent": "concept-plan",
+      "model": "zai-coding-plan/glm-5.3-flash"
     },
     {
       "id": "grounded",
       "label": "Technical plan",
-      "agent": "grounded-hard"
+      "agent": "grounded-hard",
+      "model": "zai-coding-plan/glm-5.3"
     },
     {
       "id": "execution",
       "label": "Execution",
-      "agent": "execution-plan"
+      "agent": "execution-plan",
+      "model": "zai-coding-plan/glm-5.3"
     }
   ]
 }

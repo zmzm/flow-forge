@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -75,6 +76,7 @@ VARIANT: Optional[str] = None
 USE_ATTACH = False
 ATTACH_URL = "http://localhost:4096"
 STEP_TIMEOUT_SEC: Optional[int] = _optional_int_env("FLOWFORGE_STEP_TIMEOUT_SECONDS", 3600)
+HEARTBEAT_SEC: Optional[int] = _optional_int_env("FLOWFORGE_HEARTBEAT_SECONDS", 30)
 SHARE_SESSION = False
 
 EventCallback = Optional[Callable[[Dict[str, Any]], None]]
@@ -393,10 +395,31 @@ def select_steps_for_task(task: Dict[str, Any], steps: List[Dict[str, Any]]) -> 
     return [], "already_complete"
 
 
-def find_next_todo(tasks: List[Dict[str, Any]]) -> Optional[int]:
+MONTH_BASE_YEAR = 2026
+TASK_ID_MONTH_RE = re.compile(r"^f(\d+)-")
+
+
+def task_month_number(task_id: Any) -> Optional[int]:
+    match = TASK_ID_MONTH_RE.match(str(task_id or ""))
+    return int(match.group(1)) if match else None
+
+
+def current_month_number(now: Optional[datetime] = None) -> int:
+    now = now or datetime.now()
+    return (now.year - MONTH_BASE_YEAR) * 12 + now.month
+
+
+def find_next_todo(
+    tasks: List[Dict[str, Any]], max_month: Optional[int] = None
+) -> Optional[int]:
     for i, t in enumerate(tasks):
-        if t.get("status", "todo") == "todo":
-            return i
+        if t.get("status", "todo") != "todo":
+            continue
+        if max_month is not None:
+            month = task_month_number(t.get("id"))
+            if month is not None and month > max_month:
+                continue
+        return i
     return None
 
 
@@ -587,6 +610,19 @@ def build_pipeline_steps(
     return steps
 
 
+def _proc_stat_snapshot(pid: int) -> Optional[Tuple[float, int]]:
+    """Best-effort (cpu_seconds, rss_bytes) for a pid; None when unavailable."""
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = data.rsplit(")", 1)[1].split()
+        ticks = os.sysconf("SC_CLK_TCK")
+        cpu_seconds = (int(fields[11]) + int(fields[12])) / ticks
+        rss_bytes = int(fields[21]) * os.sysconf("SC_PAGE_SIZE")
+        return cpu_seconds, rss_bytes
+    except (OSError, ValueError, IndexError, KeyError, ZeroDivisionError):
+        return None
+
+
 def run_opencode_step_stream(
     *,
     agent: str,
@@ -639,11 +675,48 @@ def run_opencode_step_stream(
         timer.daemon = True
         timer.start()
 
+    step_started = time.monotonic()
+    last_activity = [time.monotonic()]
+    stop_beat = threading.Event()
+
+    def _heartbeat() -> None:
+        assert HEARTBEAT_SEC is not None
+        last_beat = time.monotonic()
+        prev_stat: Optional[Tuple[float, int]] = None
+        while not stop_beat.wait(HEARTBEAT_SEC):
+            now = time.monotonic()
+            if now - last_activity[0] < HEARTBEAT_SEC:
+                continue
+            alive = proc.poll() is None
+            stat = _proc_stat_snapshot(proc.pid) if alive else None
+            detail = ""
+            if stat and prev_stat and now > last_beat:
+                cpu_pct = (stat[0] - prev_stat[0]) / (now - last_beat) * 100
+                detail = f", cpu {cpu_pct:.1f}%, rss {stat[1] / (1024 * 1024):.0f}MB"
+            prev_stat = stat
+            last_beat = now
+            text = (
+                f"[heartbeat] agent '{agent}' {int(now - step_started)}s in step, "
+                f"no output for {int(now - last_activity[0])}s "
+                f"(pid {proc.pid} {'alive' if alive else 'exited'}{detail})"
+            )
+            emit(callback, {"kind": "line", "text": text})
+            try:
+                with log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(text + "\n")
+            except OSError:
+                pass
+
+    beat_thread = threading.Thread(target=_heartbeat, daemon=True) if HEARTBEAT_SEC else None
+    if beat_thread:
+        beat_thread.start()
+
     raw: List[str] = []
     sess: Optional[str] = session_id
     assert proc.stdout is not None
     try:
         for line in proc.stdout:
+            last_activity[0] = time.monotonic()
             if control and control.stop_requested and proc.poll() is None:
                 try:
                     proc.terminate()
@@ -664,6 +737,7 @@ def run_opencode_step_stream(
             except Exception:
                 emit(callback, {"kind": "line", "text": line})
     finally:
+        stop_beat.set()
         if timer:
             timer.cancel()
     if control:
@@ -720,6 +794,9 @@ def run_selected_task(
     log_path = RUNS_DIR / f"{run_id}.log"
     title = f"{selected_id}: {task_file.name}"
     session_id: Optional[str] = None
+    resume_session_id: Optional[str] = None
+    if task.get("status") == "failed":
+        resume_session_id = str(task.get("session_id") or "") or None
     failed_stage: Optional[str] = None
 
     task["status"] = "running"
@@ -802,9 +879,10 @@ def run_selected_task(
                 log_path=log_path,
                 callback=callback,
                 control=control,
-                title=title if step_index == 0 else None,
-                session_id=session_id,
+                title=title,
+                session_id=resume_session_id,
             )
+            resume_session_id = None
             session_id = sid or session_id
 
             provider_error = parse_opencode_error_from_json_events(step_output)

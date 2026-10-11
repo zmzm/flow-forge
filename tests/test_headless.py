@@ -3,6 +3,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 try:
@@ -199,6 +200,95 @@ class BatchTests(HeadlessTestCase):
         config = hr.BatchConfig()
         with self.assertRaises(ValueError):
             hr.run_batch(config, self.notifier, task_id="nope", run_task=lambda task_id, callback: ok_result(task_id))
+
+
+class MonthGateTests(HeadlessTestCase):
+    SEPTEMBER = datetime(2026, 9, 22)
+    OCTOBER = datetime(2026, 10, 1)
+    JANUARY_2027 = datetime(2027, 1, 5)
+
+    def config(self):
+        return hr.BatchConfig(max_tasks=5, stop_on_failure=True, max_runtime_seconds=0)
+
+    def test_runs_current_month_task(self):
+        write_tasks([
+            make_task("f9-d1", status="done"),
+            make_task("f9-d2"),
+            make_task("f10-d1"),
+        ])
+        seen = []
+        stateful = stateful_run_task(ok_result)
+
+        def run_task(task_id, callback):
+            seen.append(task_id)
+            return stateful(task_id, callback)
+
+        outcome = hr.run_batch(
+            self.config(), self.notifier, run_task=run_task, now=self.SEPTEMBER
+        )
+        self.assertEqual(seen, ["f9-d2"])
+        self.assertEqual(outcome.reason, "month_gated")
+
+    def test_stops_when_only_future_months_remain(self):
+        write_tasks([
+            make_task("f9-d1", status="done"),
+            make_task("f10-d1"),
+            make_task("f10-d2"),
+        ])
+        outcome = hr.run_batch(
+            self.config(),
+            self.notifier,
+            run_task=lambda task_id, callback: ok_result(task_id),
+            now=self.SEPTEMBER,
+        )
+        self.assertEqual(outcome.outcomes, [])
+        self.assertEqual(outcome.reason, "month_gated")
+        self.assertEqual(outcome.exit_code, hr.EXIT_OK)
+        summary = [e for e in self.notifier.events if e[0] == "run_completed"][0][1]
+        self.assertEqual(summary["reason"], "month_gated")
+        self.assertIn("f9", summary["message"])
+        self.assertIn("2 future task(s)", summary["message"])
+
+    def test_all_done_is_queue_empty_not_month_gated(self):
+        write_tasks([make_task("f9-d1", status="done"), make_task("f10-d1", status="done")])
+        outcome = hr.run_batch(
+            self.config(),
+            self.notifier,
+            run_task=lambda task_id, callback: ok_result(task_id),
+            now=self.SEPTEMBER,
+        )
+        self.assertEqual(outcome.reason, "queue_empty")
+        self.assertEqual(self.notifier.events, [])
+
+    def test_month_number_rolls_past_december(self):
+        write_tasks([make_task("f12-d1"), make_task("f13-d1"), make_task("f14-d1")])
+        seen = []
+        stateful = stateful_run_task(ok_result)
+
+        def run_task(task_id, callback):
+            seen.append(task_id)
+            return stateful(task_id, callback)
+
+        outcome = hr.run_batch(
+            self.config(), self.notifier, run_task=run_task, now=self.JANUARY_2027
+        )
+        self.assertEqual(seen, ["f12-d1", "f13-d1"])
+        self.assertEqual(outcome.reason, "month_gated")
+
+    def test_explicit_task_id_bypasses_gate(self):
+        write_tasks([make_task("f10-d1")])
+        seen = []
+
+        def run_task(task_id, callback):
+            seen.append(task_id)
+            return ok_result(task_id)
+
+        outcome = hr.run_batch(
+            self.config(), self.notifier, task_id="f10-d1",
+            run_task=run_task, now=self.SEPTEMBER,
+        )
+        self.assertEqual(seen, ["f10-d1"])
+        self.assertEqual(outcome.reason, "completed")
 
     def test_run_exception_counts_as_failure(self):
         write_tasks([make_task("a"), make_task("b")])

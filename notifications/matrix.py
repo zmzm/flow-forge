@@ -123,6 +123,9 @@ class MatrixNotifier(Notifier):
         for item in summary.get("results", []):
             mark = "✅" if item.get("ok") else "❌"
             lines.append(f"{mark} {task_line(item)}")
+        message = str(summary.get("message") or "").strip()
+        if message:
+            lines.append(message)
         lines.append(f"Completed: {summary.get('completed', 0)}")
         lines.append(f"Failed: {summary.get('failed', 0)}")
         if summary.get("duration_sec") is not None:

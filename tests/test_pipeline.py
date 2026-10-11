@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -41,6 +42,22 @@ import time
 
 print(json.dumps({"type": "event", "sessionID": "ses-hang"}), flush=True)
 time.sleep(60)
+"""
+
+FAKE_ARGS = r"""#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+args_file = Path(__file__).with_suffix(".args")
+calls = args_file.read_text(encoding="utf-8").splitlines() if args_file.exists() else []
+calls.append(json.dumps(sys.argv[1:]))
+args_file.write_text("\n".join(calls) + "\n", encoding="utf-8")
+files = [Path(sys.argv[i + 1]) for i, a in enumerate(sys.argv) if a == "--file"]
+src = files[0]
+for name in ("concept-plan.md", "grounded-plan.md", "execution.md"):
+    (src.parent / name).write_text("# " + name + "\n", encoding="utf-8")
+print(json.dumps({"type": "event", "sessionID": "ses-%d" % len(calls)}))
 """
 
 
@@ -84,6 +101,47 @@ class OptionalIntEnvTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"FLOWFORGE_TEST_INT": "abc"}):
             with self.assertRaises(RuntimeError):
                 pr._optional_int_env("FLOWFORGE_TEST_INT", 5)
+
+
+class MonthNumberTests(unittest.TestCase):
+    def test_task_month_number(self):
+        self.assertEqual(pr.task_month_number("f9-d2"), 9)
+        self.assertEqual(pr.task_month_number("f13-d1"), 13)
+        self.assertEqual(pr.task_month_number("task-a"), None)
+        self.assertEqual(pr.task_month_number(None), None)
+        self.assertEqual(pr.task_month_number(""), None)
+
+    def test_current_month_number(self):
+        self.assertEqual(pr.current_month_number(datetime(2026, 9, 22)), 9)
+        self.assertEqual(pr.current_month_number(datetime(2026, 12, 31)), 12)
+        self.assertEqual(pr.current_month_number(datetime(2027, 1, 1)), 13)
+        self.assertEqual(pr.current_month_number(datetime(2027, 6, 15)), 18)
+
+
+class FindNextTodoTests(unittest.TestCase):
+    @staticmethod
+    def task(task_id, status="todo"):
+        return {"id": task_id, "status": status, "task_file": f"/tmp/{task_id}.md"}
+
+    def test_ungated_by_default(self):
+        tasks = [self.task("f10-d1", "done"), self.task("f11-d1")]
+        self.assertEqual(pr.find_next_todo(tasks), 1)
+
+    def test_gate_skips_future_months(self):
+        tasks = [self.task("f10-d1", "done"), self.task("f11-d1"), self.task("f12-d1")]
+        self.assertEqual(pr.find_next_todo(tasks, max_month=10), None)
+
+    def test_gate_allows_current_and_past_months(self):
+        tasks = [
+            self.task("f9-d1"),
+            self.task("f10-d1", "done"),
+            self.task("f11-d1"),
+        ]
+        self.assertEqual(pr.find_next_todo(tasks, max_month=10), 0)
+
+    def test_gate_ignores_unprefixed_ids(self):
+        tasks = [self.task("f11-d1"), self.task("manual-task")]
+        self.assertEqual(pr.find_next_todo(tasks, max_month=10), 1)
 
 
 class StepSelectionTests(unittest.TestCase):
@@ -287,6 +345,105 @@ class RunSelectedTaskTests(PipelineIntegrationTestCase):
         starts = [e.get("label") for e in events if e.get("kind") == "step_start"]
         self.assertEqual(starts, ["Technical plan", "Execution"])
         self.assertEqual(self.task_row()["status"], "done")
+
+    def captured_calls(self, name):
+        lines = (self.tmp / (name + ".args")).read_text(encoding="utf-8").splitlines()
+        return [json.loads(line) for line in lines]
+
+    def test_fresh_run_starts_session_per_step(self):
+        self.add_task()
+        bin_path = self.make_opencode("fake-perstep", FAKE_ARGS)
+        with mock.patch.dict(os.environ, {"OPENCODE_BIN": str(bin_path)}):
+            result = pr.run_selected_task(task_id="t1")
+        self.assertTrue(result.ok)
+        calls = self.captured_calls("fake-perstep")
+        self.assertEqual(len(calls), 3)
+        for args in calls:
+            self.assertNotIn("--session", args)
+            self.assertIn("t1: task.md", args)
+        self.assertEqual(self.task_row()["session_id"], "ses-3")
+
+    def test_failed_resume_continues_recorded_session_for_first_step_only(self):
+        (self.project / "concept-plan.md").write_text("x", encoding="utf-8")
+        (self.project / "task.md").write_text("# Sample task\n", encoding="utf-8")
+        pr.write_tasks_jsonl(
+            pr.TASKS_FILE,
+            [{"id": "t1", "task_file": "task.md", "status": "failed", "session_id": "ses-old"}],
+        )
+        bin_path = self.make_opencode("fake-resume", FAKE_ARGS)
+        with mock.patch.dict(os.environ, {"OPENCODE_BIN": str(bin_path)}):
+            result = pr.run_selected_task(task_id="t1")
+        self.assertTrue(result.ok)
+        calls = self.captured_calls("fake-resume")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][calls[0].index("--session") + 1], "ses-old")
+        self.assertNotIn("--session", calls[1])
+        self.assertEqual(self.task_row()["session_id"], "ses-2")
+
+
+class HeartbeatTests(PipelineIntegrationTestCase):
+    def test_proc_stat_snapshot_self(self):
+        snap = pr._proc_stat_snapshot(os.getpid())
+        if snap is None:
+            self.skipTest("/proc unavailable")
+        cpu, rss = snap
+        self.assertGreaterEqual(cpu, 0.0)
+        self.assertGreater(rss, 0)
+
+    def test_heartbeat_emitted_when_silent(self):
+        self.add_task()
+        bin_path = self.make_opencode("fake-quiet", FAKE_HANG)
+        events = []
+        log_path = pr.RUNS_DIR / "heartbeat.log"
+        pr.RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        with mock.patch.dict(os.environ, {"OPENCODE_BIN": str(bin_path)}), \
+                mock.patch.object(pr, "STEP_TIMEOUT_SEC", 4), \
+                mock.patch.object(pr, "HEARTBEAT_SEC", 1):
+            rc, _out, sid, timed_out = pr.run_opencode_step_stream(
+                agent="execution-plan",
+                model=None,
+                message="do it",
+                files=[self.project / "task.md"],
+                cwd=self.project,
+                log_path=log_path,
+                callback=events.append,
+            )
+        self.assertNotEqual(rc, 0)
+        self.assertTrue(timed_out)
+        beats = [e for e in events if e.get("kind") == "line" and "[heartbeat]" in e.get("text", "")]
+        self.assertTrue(beats)
+        log_text = log_path.read_text(encoding="utf-8")
+        self.assertIn("[heartbeat]", log_text)
+        self.assertIn("agent 'execution-plan'", log_text)
+
+    def test_no_heartbeat_when_streaming(self):
+        script_body = r"""#!/usr/bin/env python3
+import json, sys, time
+print(json.dumps({"type": "event", "sessionID": "ses-chatty"}), flush=True)
+for _ in range(6):
+    time.sleep(0.6)
+    print(json.dumps({"type": "event", "n": 1}), flush=True)
+"""
+        self.add_task()
+        bin_path = self.make_opencode("fake-chatty", script_body)
+        events = []
+        log_path = pr.RUNS_DIR / "chatty.log"
+        pr.RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        with mock.patch.dict(os.environ, {"OPENCODE_BIN": str(bin_path)}), \
+                mock.patch.object(pr, "HEARTBEAT_SEC", 1):
+            rc, _out, _sid, timed_out = pr.run_opencode_step_stream(
+                agent="execution-plan",
+                model=None,
+                message="do it",
+                files=[self.project / "task.md"],
+                cwd=self.project,
+                log_path=log_path,
+                callback=events.append,
+            )
+        self.assertEqual(rc, 0)
+        self.assertFalse(timed_out)
+        beats = [e for e in events if e.get("kind") == "line" and "[heartbeat]" in e.get("text", "")]
+        self.assertEqual(beats, [])
 
 
 if __name__ == "__main__":

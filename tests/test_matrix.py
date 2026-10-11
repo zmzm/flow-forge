@@ -141,6 +141,20 @@ class MatrixMessageTests(unittest.TestCase):
         self.assertIn("Failed: 1", body)
         self.assertIn("Duration: 2h 17m", body)
 
+    def test_run_completed_message_with_idle_month_reason(self):
+        self.notifier.run_completed({
+            "results": [],
+            "completed": 0,
+            "failed": 0,
+            "duration_sec": 0.5,
+            "reason": "month_gated",
+            "message": "No active tasks for month f9; 2 future task(s) on hold.",
+        })
+        body = self.sent()
+        self.assertIn("FlowForge run finished", body)
+        self.assertIn("No active tasks for month f9", body)
+        self.assertIn("Completed: 0", body)
+
 
 class MatrixHttpTests(unittest.TestCase):
     def test_send_builds_correct_request(self):

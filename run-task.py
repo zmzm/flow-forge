@@ -21,6 +21,12 @@ def main() -> int:
         type=int,
         help="Process up to N tasks this run (overrides FLOWFORGE_MAX_TASKS_PER_RUN)",
     )
+    parser.add_argument(
+        "--step-timeout",
+        dest="step_timeout",
+        type=int,
+        help="Per-step timeout in seconds for this run only (0 = unlimited; overrides FLOWFORGE_STEP_TIMEOUT_SECONDS)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -34,6 +40,8 @@ def main() -> int:
 
         config = headless_runner.batch_config_from_env(max_tasks_override=args.max_tasks)
         notifier = build_notifier()
+        if args.step_timeout is not None:
+            headless_runner.pr.STEP_TIMEOUT_SEC = args.step_timeout or None
     except (RuntimeError, ValueError) as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return EXIT_CONFIG
