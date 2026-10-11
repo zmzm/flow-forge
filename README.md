@@ -1,5 +1,8 @@
 # FlowForge
 
+<img width="1200" height="600" alt="flowForge" src="https://github.com/user-attachments/assets/852880d7-1a0e-48bc-8982-bad8b6a14cdc" />
+
+
 FlowForge runs configurable, multi-step AI workflows through the OpenCode CLI. It manages a task queue in `tasks.jsonl`, chains agents through output files, and records task status, sessions, and logs.
 
 Use it interactively in a terminal, run batches from the command line, or schedule autonomous runs on a server. The Textual TUI is one interface to the same execution engine.
