@@ -1,0 +1,11 @@
+{
+  "defaults": {
+    "workflow": "default",
+    "step_timeout": 3600,
+    "heartbeat": 30,
+    "max_tasks": 1,
+    "max_runtime": 14400,
+    "stop_on_failure": true,
+    "month_gate": false
+  }
+}

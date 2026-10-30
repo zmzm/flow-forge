@@ -1,0 +1,8 @@
+{
+  "id": "existing",
+  "workspace": "/srv/projects/existing",
+  "tasks_file": "/srv/projects/existing/tasks.jsonl",
+  "workflow_file": "/srv/projects/existing/steps.json",
+  "runs_dir": "/opt/flowforge/runs",
+  "month_gate": true
+}

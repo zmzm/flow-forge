@@ -5,6 +5,16 @@ Tasks terminal UI.
 - Bottom: live run header + events feed
 """
 
+# Help is available on headless installations without optional UI dependencies.
+if __name__ == "__main__":
+    import sys
+    if "--help" in sys.argv or "-h" in sys.argv:
+        import argparse
+        from flowforge_cli import selection
+        help_parser = argparse.ArgumentParser(description="FlowForge task UI for one selected project")
+        selection(help_parser)
+        help_parser.parse_args()
+
 import threading
 import json
 from pathlib import Path
@@ -19,7 +29,6 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Input, RichLog, Static, TextArea
 
 
-TASKS_FILE = runner.TASKS_FILE
 FILTERS = ["all", "todo", "running", "failed", "done"]
 EVENT_TEXT_LIMIT = 2_000
 TOOL_PREVIEW_LIMIT = 400
@@ -109,12 +118,8 @@ def read_tasks(path: Path) -> List[Dict[str, Any]]:
         return []
 
 
-def write_tasks(path: Path, tasks: List[Dict[str, Any]]) -> None:
-    runner.write_tasks_jsonl(path, tasks)
-
-
-def fmt_agents(task: Dict[str, Any]) -> str:
-    step_configs = runner.read_step_configs()
+def fmt_agents(task: Dict[str, Any], context=None) -> str:
+    step_configs = context.steps(task) if context else runner.read_step_configs()
     agents = runner.task_agents(task, step_configs)
     return ", ".join(agents[step["id"]] for step in step_configs)
 
@@ -180,10 +185,12 @@ class EditTaskScreen(ModalScreen[Optional[Dict[str, Any]]]):
         ("ctrl+s", "save", "Save"),
     ]
 
-    def __init__(self, task: Dict[str, Any]) -> None:
+    def __init__(self, task: Dict[str, Any], context=None) -> None:
         super().__init__()
+        self.context = context
         self.task_data = task
-        self.step_configs = runner.read_step_configs()
+        self._workflow_value = str(task.get("workflow") or "")
+        self.step_configs = context.steps(task) if context else runner.read_step_configs()
 
     def compose(self) -> ComposeResult:
         agents = runner.task_agents(self.task_data, self.step_configs)
@@ -192,7 +199,9 @@ class EditTaskScreen(ModalScreen[Optional[Dict[str, Any]]]):
         run_steps = runner.task_run_step_ids(self.task_data) or []
 
         yield Vertical(
-            Static(f"EDIT TASK: {self.task_data.get('id', '-')}", id="dialog_title"),
+            Static(f"EDIT TASK: {self.task_data.get('id', '-')}", id="dialog_title", markup=False),
+            Static("Workflow (empty = project default)", classes="label"),
+            Input(value=str(self.task_data.get("workflow") or ""), id="workflow", classes="inp"),
             Static("Agents (comma-separated, in step order)", classes="label"),
             Input(value=", ".join(agent_values), id="agents", classes="inp"),
             Static("Run steps (comma-separated, empty = all/auto-resume)", classes="label"),
@@ -202,9 +211,30 @@ class EditTaskScreen(ModalScreen[Optional[Dict[str, Any]]]):
                 Button("Cancel", id="cancel"),
                 id="actions",
             ),
-            Static(f"Order: {step_order}\nFailed tasks auto-resume from first missing output when empty.\nEsc cancel | Ctrl+S save", id="hint"),
+            Static(f"Order: {step_order}\n{self._catalog_hint()}\nEsc cancel | Ctrl+S save", id="hint", markup=False),
             id="dialog",
         )
+
+    def _catalog_hint(self) -> str:
+        if self.context is None:
+            return "Any OpenCode agent may be selected."
+        from flowforge_agents import catalog
+        return "Catalog: " + ", ".join(item["id"] for item in catalog(self.context) if not item["issues"])
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "workflow" or not self.is_mounted or self.context is None:
+            return
+        if event.value.strip() == self._workflow_value:
+            return
+        try:
+            task = {**self.task_data, "workflow": event.value.strip() or None}
+            self._workflow_value = event.value.strip()
+            self.step_configs = self.context.steps(task)
+            self.query_one("#agents", Input).value = ", ".join(step["agent"] for step in self.step_configs)
+            self.query_one("#run_steps", Input).value = ""
+            self.query_one("#hint", Static).update("Order: " + ", ".join(step["id"] for step in self.step_configs) + "\n" + self._catalog_hint())
+        except (OSError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -220,6 +250,13 @@ class EditTaskScreen(ModalScreen[Optional[Dict[str, Any]]]):
             self._save()
 
     def _save(self) -> None:
+        workflow = self.query_one("#workflow", Input).value.strip()
+        try:
+            if self.context:
+                self.step_configs = self.context.steps({**self.task_data, "workflow": workflow or None})
+        except (OSError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+            return
         raw_agents = self.query_one("#agents", Input).value
         agent_values = [item.strip() for item in raw_agents.split(",") if item.strip()]
         if len(agent_values) != len(self.step_configs):
@@ -232,11 +269,15 @@ class EditTaskScreen(ModalScreen[Optional[Dict[str, Any]]]):
         run_steps = [item.strip() for item in raw_run_steps.split(",") if item.strip()]
         allowed_steps = {step["id"] for step in self.step_configs}
         unknown_steps = [step_id for step_id in run_steps if step_id not in allowed_steps]
+        if len(run_steps) != len(set(run_steps)):
+            self.notify("Duplicate run steps", severity="error")
+            return
         if unknown_steps:
             self.notify(f"Unknown run steps: {', '.join(unknown_steps)}", severity="error")
             return
         result = {
             "id": str(self.task_data.get("id", "")),
+            "workflow": workflow,
             "agents": {
                 step["id"]: agent_values[index]
                 for index, step in enumerate(self.step_configs)
@@ -246,76 +287,14 @@ class EditTaskScreen(ModalScreen[Optional[Dict[str, Any]]]):
         if not all(result["agents"].values()):
             self.notify("Agent values cannot be empty", severity="error")
             return
-        self.dismiss(result)
-
-
-class AddAgentsScreen(ModalScreen[bool]):
-    CSS = """
-    AddAgentsScreen {
-        align: center middle;
-    }
-
-    #dialog {
-        width: 88;
-        height: 13;
-        border: round #85662b;
-        background: #171306;
-        padding: 1 2;
-    }
-
-    #dialog_title {
-        height: 1;
-        color: #ffd37a;
-        text-style: bold;
-        margin-bottom: 1;
-    }
-
-    #message {
-        height: 5;
-        color: #f4ddb0;
-    }
-
-    #actions {
-        height: 3;
-        margin-top: 1;
-    }
-    """
-
-    BINDINGS = [
-        ("escape", "cancel", "Cancel"),
-    ]
-
-    def __init__(self, additions: List[Dict[str, str]]) -> None:
-        super().__init__()
-        self.additions = additions
-
-    def compose(self) -> ComposeResult:
-        lines = [f"{item['label']} ({item['step_id']}): {item['agent']}" for item in self.additions]
-        yield Vertical(
-            Static("ADD AGENTS", id="dialog_title"),
-            Static(
-                "These agents are not listed in steps.json:\n"
-                + "\n".join(lines)
-                + "\nAdd them before saving?",
-                id="message",
-            ),
-            Horizontal(
-                Button("Add and Save", id="add", variant="warning"),
-                Button("Cancel", id="cancel"),
-                id="actions",
-            ),
-            id="dialog",
-        )
-
-    def action_cancel(self) -> None:
-        self.dismiss(False)
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "add":
-            self.dismiss(True)
+        try:
+            if self.context and not self.context.legacy:
+                from flowforge_agents import validate_agents
+                validate_agents(self.context, result["agents"].values())
+        except ValueError as exc:
+            self.notify(str(exc), severity="error")
             return
-        if event.button.id == "cancel":
-            self.dismiss(False)
+        self.dismiss(result)
 
 
 class EditStepsConfigScreen(ModalScreen[Optional[List[Dict[str, Any]]]]):
@@ -363,9 +342,10 @@ class EditStepsConfigScreen(ModalScreen[Optional[List[Dict[str, Any]]]]):
         ("ctrl+n", "add_step", "Add Step"),
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, context=None) -> None:
         super().__init__()
-        self.step_configs = runner.read_step_configs()
+        self.context = context
+        self.step_configs = context.steps() if context else runner.read_step_configs()
 
     def compose(self) -> ComposeResult:
         yield Vertical(
@@ -383,7 +363,7 @@ class EditStepsConfigScreen(ModalScreen[Optional[List[Dict[str, Any]]]]):
                 id="actions",
             ),
             Static(
-                "Edit steps.json directly. Required per step: id, label, agent. Optional: model, agents.\n"
+                "Edit this project’s default workflow. Required: id, label, agent. Optional: model, agents.\n"
                 "New step ids use generic sequential execution and write <step-id>.md.\n"
                 "Esc cancel | Ctrl+S save | Ctrl+N add step",
                 id="hint",
@@ -423,6 +403,9 @@ class EditStepsConfigScreen(ModalScreen[Optional[List[Dict[str, Any]]]]):
         try:
             raw = self._read_editor_doc()
             configs = runner.normalize_step_configs(raw.get("steps"), "steps editor")
+            if self.context and not self.context.legacy:
+                from flowforge_agents import validate_agents
+                validate_agents(self.context, [step["agent"] for step in configs])
         except Exception as exc:
             self.notify(str(exc), severity="error")
             return
@@ -533,8 +516,12 @@ class TasksUI(App):
         ("c", "clear_events", "Clear Feed"),
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, context=None) -> None:
         super().__init__()
+        if context is None:
+            from flowforge_config import legacy_context
+            context = legacy_context()
+        self.context = context
         self.tasks: List[Dict[str, Any]] = []
         self.visible_tasks: List[Dict[str, Any]] = []
         self.filter_index = 0
@@ -609,7 +596,7 @@ class TasksUI(App):
             return
 
         try:
-            step_configs = runner.read_step_configs()
+            step_configs = self.context.steps(task)
             runner.task_agents(task, step_configs)
         except ValueError as exc:
             self._set_status(str(exc))
@@ -622,9 +609,16 @@ class TasksUI(App):
             self._set_status("Runner is already active")
             return
 
-        lock = runner.acquire_lock(runner.RUNS_DIR / ".flowforge.lock")
+        from flowforge_storage import acquire_execution
+        lock = acquire_execution(self.context)
         if lock is None:
             self._set_status("Another FlowForge process is active; finish it before running here")
+            return
+        try:
+            runner.recover_stale_running_tasks(self.context.tasks_file)
+        except (OSError, ValueError) as exc:
+            lock.close()
+            self._set_status(str(exc))
             return
         self.run_lock = lock
 
@@ -656,16 +650,16 @@ class TasksUI(App):
             self._set_status("No task selected")
             return
         try:
-            step_configs = runner.read_step_configs()
+            step_configs = self.context.steps(task)
             runner.task_agents(task, step_configs)
         except ValueError as exc:
             self._set_status(str(exc))
             return
-        self.push_screen(EditTaskScreen(task), self._on_edit_done)
+        self.push_screen(EditTaskScreen(task, self.context), self._on_edit_done)
 
     def action_edit_steps_config(self) -> None:
         try:
-            self.push_screen(EditStepsConfigScreen(), self._on_steps_config_done)
+            self.push_screen(EditStepsConfigScreen(self.context), self._on_steps_config_done)
         except ValueError as exc:
             self._set_status(str(exc))
 
@@ -673,7 +667,8 @@ class TasksUI(App):
         if not result:
             self._set_status("Config edit canceled")
             return
-        runner.write_step_configs(result)
+        from flowforge_config import save_project_steps
+        self.context = save_project_steps(self.context, result)
         self._load_and_render()
         self._set_status("Saved steps config")
 
@@ -683,32 +678,12 @@ class TasksUI(App):
             return
 
         try:
-            step_configs = runner.read_step_configs()
-            unknown_agents = runner.unknown_task_agents({"agents": result["agents"]}, step_configs)
-        except ValueError as exc:
+            if not self.context.legacy:
+                from flowforge_agents import validate_agents
+                validate_agents(self.context, result["agents"].values())
+            self._save_edit_result(result)
+        except (OSError, ValueError) as exc:
             self._set_status(str(exc))
-            return
-
-        if unknown_agents:
-            self.push_screen(
-                AddAgentsScreen(unknown_agents),
-                lambda should_add: self._on_add_agents_done(should_add, result, unknown_agents),
-            )
-            return
-
-        self._save_edit_result(result)
-
-    def _on_add_agents_done(
-        self,
-        should_add: bool,
-        result: Dict[str, Any],
-        additions: List[Dict[str, str]],
-    ) -> None:
-        if not should_add:
-            self._set_status("Save canceled")
-            return
-        runner.add_known_step_agents(additions)
-        self._save_edit_result(result)
 
     def _save_edit_result(self, result: Dict[str, Any]) -> None:
 
@@ -717,24 +692,15 @@ class TasksUI(App):
             self._set_status("Edited task has no id")
             return
 
-        updated = False
-        for item in self.tasks:
-            if str(item.get("id", "")) == task_id:
-                item["agents"] = result["agents"]
-                if result["run_steps"]:
-                    item["run_steps"] = result["run_steps"]
-                else:
-                    item.pop("run_steps", None)
-                item.pop("steps", None)
-                item.pop("step_labels", None)
-                updated = True
-                break
-
-        if not updated:
-            self._set_status(f"Task not found: {task_id}")
-            return
-
-        write_tasks(TASKS_FILE, self.tasks)
+        from flowforge_storage import update_task
+        updates = {"agents": result["agents"]}
+        remove = ["steps", "step_labels"]
+        for key in ("run_steps", "workflow"):
+            if result.get(key):
+                updates[key] = result[key]
+            else:
+                remove.append(key)
+        update_task(self.context.tasks_file, task_id, updates, remove)
         self._load_and_render()
         self._set_status(f"Saved: {task_id}")
 
@@ -744,12 +710,13 @@ class TasksUI(App):
                 task_id=task_id,
                 callback=self._event_from_runner,
                 control=self.run_control,
+                context=self.context,
             )
         except Exception as exc:
             result = runner.RunResult(False, task_id, None, None, f"Runner error: {exc}")
         finally:
             if self.run_lock:
-                runner.release_lock(self.run_lock)
+                self.run_lock.close()
                 self.run_lock = None
 
         def finalize() -> None:
@@ -887,7 +854,7 @@ class TasksUI(App):
         self.query_one("#events_header", Static).update(hdr)
 
     def _load_and_render(self) -> None:
-        self.tasks = read_tasks(TASKS_FILE)
+        self.tasks = read_tasks(self.context.tasks_file)
         status_filter = FILTERS[self.filter_index]
         if status_filter == "all":
             self.visible_tasks = list(self.tasks)
@@ -898,7 +865,7 @@ class TasksUI(App):
         table.clear()
         for task in self.visible_tasks:
             try:
-                agents_text = fmt_agents(task)
+                agents_text = fmt_agents(task, self.context)
             except ValueError:
                 agents_text = "invalid agents"
             table.add_row(
@@ -919,7 +886,7 @@ class TasksUI(App):
 
         self.query_one("#toolbar", Static).update(
             (
-                f"[b]tasks.jsonl[/b] | filter: [cyan]{status_filter}[/cyan] "
+                f"[b]{escape(self.context.project_id)}[/b] | filter: [cyan]{status_filter}[/cyan] "
                 f"| total: {len(self.tasks)} | shown: {len(self.visible_tasks)} | keys: e edit task, g config, r run, s stop"
             )
         )
@@ -963,7 +930,7 @@ class TasksUI(App):
 
         agents_lines: List[str] = []
         try:
-            step_configs = runner.read_step_configs()
+            step_configs = self.context.steps(task)
             effective_agents = runner.task_agents(task, step_configs)
             run_steps = runner.task_run_step_ids(task)
             run_step_set = set(run_steps or [])
@@ -971,7 +938,9 @@ class TasksUI(App):
                 key = step["id"]
                 value = effective_agents[key]
                 model_override = str(step.get("model") or "").strip()
-                agent_model = runner.agent_configured_model(value)
+                from flowforge_agents import catalog
+                entries = {item["id"]: item for item in catalog(self.context)}
+                agent_model = entries.get(value, {}).get("model")
                 model = model_override or agent_model or "OpenCode default"
                 model_source = "step override" if model_override else ("agent" if agent_model else "OpenCode")
                 active_marker = "" if run_steps is None or key in run_step_set else " [dim](skipped)[/dim]"
@@ -999,15 +968,35 @@ class TasksUI(App):
 
     def _set_status(self, msg: str) -> None:
         self.status_text = msg
-        self.query_one("#status", Static).update(msg)
+        self.query_one("#status", Static).update(escape(msg))
 
     def _tick_spinner(self) -> None:
         if not self.runner_active or not self.running_task_id:
             return
         frame = self.spinner_frames[self.spinner_index]
         self.spinner_index = (self.spinner_index + 1) % len(self.spinner_frames)
-        self.query_one("#status", Static).update(f"{self.status_text}  {frame}")
+        self.query_one("#status", Static).update(f"{escape(self.status_text)}  {frame}")
+
+
+def main(argv=None) -> int:
+    import argparse
+    from flowforge_cli import selection
+    from flowforge_config import resolve_context
+    parser = argparse.ArgumentParser(description="FlowForge task UI for one selected project")
+    selection(parser)
+    args = parser.parse_args(argv)
+    try:
+        context = resolve_context(args.project, args.project_config, {
+            "workspace": args.workspace, "tasks_file": args.tasks_file, "runs_dir": args.runs_dir,
+            "workflow_override": args.workflow, "step_timeout": args.step_timeout, "heartbeat": args.heartbeat,
+        })
+        TasksUI(context).run()
+    except (OSError, ValueError) as exc:
+        import sys
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
-    TasksUI().run()
+    raise SystemExit(main())

@@ -175,12 +175,12 @@ def _short(session_id: str) -> str:
     return f"{session_id[:10]}..{session_id[-4:]}" if len(session_id) > 16 else session_id
 
 
-def _current_run_log(task: Dict[str, Any]) -> Optional[Path]:
+def _current_run_log(task: Dict[str, Any], context=None) -> Optional[Path]:
     task_id = str(task.get("id") or "")
     candidates: List[Path] = []
     if task_id:
         try:
-            candidates = sorted(pr.RUNS_DIR.glob(f"*_{task_id}.log"), key=lambda p: p.stat().st_mtime)
+            candidates = sorted((context.runs_dir if context else pr.RUNS_DIR).glob(f"*_{task_id}.log"), key=lambda p: p.stat().st_mtime)
         except OSError:
             candidates = []
     if candidates:
@@ -189,12 +189,12 @@ def _current_run_log(task: Dict[str, Any]) -> Optional[Path]:
     return Path(raw) if raw else None
 
 
-def _task_title(task: Dict[str, Any]) -> Optional[str]:
+def _task_title(task: Dict[str, Any], context=None) -> Optional[str]:
     raw = task.get("task_file")
     if not raw:
         return None
     try:
-        with pr.resolve_file(str(raw), pr.PROJECT_DIR).open("r", encoding="utf-8", errors="replace") as handle:
+        with pr.resolve_file(str(raw), context.workspace if context else pr.PROJECT_DIR).open("r", encoding="utf-8", errors="replace") as handle:
             chunk = handle.read(4096)
     except OSError:
         return None
@@ -210,12 +210,9 @@ def _task_title(task: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _lock_held() -> bool:
-    handle = pr.acquire_lock(pr.RUNS_DIR / ".flowforge.lock")
-    if handle is None:
-        return True
-    pr.release_lock(handle)
-    return False
+def _lock_held(context=None) -> bool:
+    from flowforge_storage import lock_held
+    return lock_held((context.runs_dir if context else pr.RUNS_DIR) / ".flowforge.lock")
 
 
 def _run_start_ms(name: str) -> Optional[int]:
@@ -275,7 +272,7 @@ def _detect_stage(
     return agent
 
 
-def build_status(*, tasks_file: Path, now_ms: Optional[int] = None) -> Dict[str, Any]:
+def build_status(*, tasks_file: Path, now_ms: Optional[int] = None, context=None) -> Dict[str, Any]:
     now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
     try:
         tasks = pr.read_tasks_jsonl(tasks_file)
@@ -289,12 +286,12 @@ def build_status(*, tasks_file: Path, now_ms: Optional[int] = None) -> Dict[str,
     rows = [
         {
             "id": str(task.get("id") or "-"),
-            "title": _task_title(task),
+            "title": _task_title(task, context),
             "status": str(task.get("status") or "todo"),
         }
         for task in tasks
     ]
-    lock_held = _lock_held()
+    lock_held = _lock_held(context)
     status: Dict[str, Any] = {
         "schema_version": STATUS_SCHEMA_VERSION,
         "lock_held": lock_held,
@@ -308,10 +305,10 @@ def build_status(*, tasks_file: Path, now_ms: Optional[int] = None) -> Dict[str,
     running_task = next((t for t in tasks if str(t.get("status")) == "running"), None)
     if running_task is not None:
         task_id = str(running_task.get("id") or "-")
-        log = _current_run_log(running_task)
+        log = _current_run_log(running_task, context)
         info: Dict[str, Any] = {
             "id": task_id,
-            "title": _task_title(running_task),
+            "title": _task_title(running_task, context),
             "session_id": str(running_task.get("session_id") or "") or None,
             "stage": _detect_stage(running_task, step_configs, log),
         }
@@ -329,9 +326,9 @@ def build_status(*, tasks_file: Path, now_ms: Optional[int] = None) -> Dict[str,
     if failed_task is not None:
         entry: Dict[str, Any] = {
             "id": str(failed_task.get("id") or "-"),
-            "title": _task_title(failed_task),
+            "title": _task_title(failed_task, context),
         }
-        log = _current_run_log(failed_task)
+        log = _current_run_log(failed_task, context)
         if log is not None and log.exists():
             entry["log_path"] = str(log)
             tail = _read_tail(log, 65_536)
@@ -345,8 +342,8 @@ def build_status(*, tasks_file: Path, now_ms: Optional[int] = None) -> Dict[str,
     return status
 
 
-def _log_info(task: Dict[str, Any], now_ms: int) -> str:
-    path = _current_run_log(task)
+def _log_info(task: Dict[str, Any], now_ms: int, context=None) -> str:
+    path = _current_run_log(task, context)
     if not path:
         return "log: -"
     if not path.exists():
@@ -385,6 +382,7 @@ def render_report(
     window_minutes: int,
     parts: int,
     notice: Optional[str] = None,
+    context=None,
 ) -> str:
     now_ms = int(time.time() * 1000)
     since_ms = now_ms - window_minutes * 60 * 1000
@@ -400,7 +398,7 @@ def render_report(
     rendered_ids: set = set()
     for task in running:
         task_id = str(task.get("id") or "?")
-        out.append(f"  {task_id}  {_log_info(task, now_ms)}")
+        out.append(f"  {task_id}  {_log_info(task, now_ms, context)}")
         sid = task.get("session_id")
         if db is None or not sid:
             out.append("    session: unknown (no db or no session_id yet)")
@@ -430,7 +428,10 @@ def render_report(
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Watch FlowForge task runs and opencode session activity.")
-    parser.add_argument("--tasks-file", type=Path, default=pr.TASKS_FILE)
+    parser.add_argument("--tasks-file", type=Path)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--project")
+    group.add_argument("--project-config")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB, help="path to opencode.db")
     parser.add_argument("--interval", type=float, default=5.0, help="refresh interval in seconds (loop mode)")
     parser.add_argument("--once", action="store_true", help="print a single report and exit")
@@ -439,8 +440,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--parts", type=int, default=3, help="recent parts shown per session")
     args = parser.parse_args(argv)
 
+    if args.project or args.project_config:
+        from flowforge_cli import main as project_cli
+        selection_args = ["--project", args.project] if args.project else ["--project-config", args.project_config]
+        return project_cli(["status", *selection_args, "--db", str(args.db), *(["--json"] if args.json else [])])
+    from flowforge_config import legacy_context
+    try:
+        context = legacy_context(overrides={"tasks_file": args.tasks_file})
+    except ValueError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
+    args.tasks_file = context.tasks_file
     if args.json:
-        print(json.dumps(build_status(tasks_file=args.tasks_file), ensure_ascii=False, indent=2))
+        print(json.dumps(build_status(tasks_file=args.tasks_file, context=context), ensure_ascii=False, indent=2))
         return 0
 
     def _report() -> str:
@@ -451,13 +463,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         except (FileNotFoundError, ValueError) as exc:
             notice = f"tasks file unreadable: {exc}"
         db = _connect(args.db.expanduser())
-        return render_report(
-            tasks=tasks,
-            db=db,
-            window_minutes=args.window,
-            parts=args.parts,
-            notice=notice,
-        )
+        try:
+            return render_report(
+                tasks=tasks, db=db, window_minutes=args.window, parts=args.parts,
+                notice=notice, context=context,
+            )
+        finally:
+            if db is not None:
+                db.close()
 
     if args.once:
         print(_report())

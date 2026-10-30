@@ -7,6 +7,20 @@ FlowForge runs configurable, multi-step AI workflows through the OpenCode CLI. I
 
 Use it interactively in a terminal, run batches from the command line, or schedule autonomous runs on a server. The Textual TUI is one interface to the same execution engine.
 
+## Standalone multi-project setup
+
+One installation now supports registered external projects, shared workflows and a
+private central agent library. Use `./flowforge project add NAME --workspace /repo
+--tasks-dir /inbox`, then `./flowforge doctor --project NAME --json` and
+`./flowforge run --project NAME --sync --max-tasks 3 --json` after importing agents.
+New directory-mode plans/reports live in per-project state, outside source files.
+
+See [setup, commands and configuration precedence](docs/projects.md),
+[agent-library migration and rollback](docs/migration.md), and the
+[Hermes JSON interface](docs/hermes.md). Existing environment-based commands below
+remain supported as compatibility mode. The new project CLI ignores stale legacy
+project settings. Imports and --help no longer require project configuration.
+
 ## Ways to Use It
 
 | Interface | Command | Purpose |
@@ -16,7 +30,7 @@ Use it interactively in a terminal, run batches from the command line, or schedu
 | Status watcher | `python3 watch-task.py` | Monitor running tasks and OpenCode sessions, including subagents |
 | Machine-readable status | `python3 watch-task.py --json` | Expose queue and runner status to integrations |
 
-The headless runner supports batch limits, per-step timeouts, heartbeat logs, and optional Matrix notifications. Example systemd units are included for scheduled server runs. The TUI and CLI share a lock to prevent overlapping execution when configured with the same runs directory.
+The headless runner supports batch limits, per-step timeouts, heartbeat logs, and optional Matrix notifications. Example systemd units are included for scheduled server runs. The TUI and CLI share canonical workspace/queue execution locks and the existing runs lock.
 
 ## Quick Start
 
@@ -89,7 +103,7 @@ Tasks can override agents or select particular steps:
 
 `run_steps` runs only the listed step ids, in the listed order. Each selected step still needs its normal input file. Without `run_steps`, non-failed tasks run the full pipeline; failed tasks resume from the first step whose output file is missing. Explicit step selection takes precedence over automatic resume.
 
-The TUI editor lets you edit agents and `run_steps` per task. If an agent is unknown for its step, it offers to add it to the step's optional `agents` list in `steps.json`. The global configuration editor validates and saves the pipeline and can insert a custom step template.
+The TUI editor lets you edit agents, task workflow and `run_steps`. Any compatible catalog agent can be selected without editing step favorites. In registered-project mode the workflow editor saves a project-specific copy; in legacy mode it edits steps.json.
 
 ## Headless Execution and Recovery
 
@@ -109,7 +123,7 @@ python3 run-task.py --task-id task-1 --step-timeout 7200
 python3 run-task.py --task-id task-1 --step-timeout 0
 ```
 
-Logs are stored in `runs/<timestamp>_<task_id>.log` by default. Quiet steps emit heartbeat lines with elapsed time and process information. Queue writes use an atomic file replacement, and execution updates merge into a freshly read queue to preserve concurrent edits.
+Legacy logs are stored in `runs/<timestamp>_<uuid>_<task_id>.log` by default. Quiet steps emit heartbeat lines with elapsed time and process information. Queue writes use an atomic file replacement, and execution updates merge into a freshly read queue to preserve concurrent edits.
 
 CLI exit codes: `0` for successful completion, an empty or month-gated queue, or an already-held lock; `1` for task failure; `2` for configuration/startup errors. Matrix delivery failures are logged and do not change task results or exit codes.
 

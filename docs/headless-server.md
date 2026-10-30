@@ -24,6 +24,21 @@ side; FlowForge does not start, stop, or expose it — it only launches OpenCode
 with `PROJECT_DIR` as the working directory, so OpenCode/Serena detect the
 target project themselves.
 
+## Registered projects
+
+The environment-based deployment below remains supported. For a shared installation,
+follow [project setup](projects.md) and [migration](migration.md). The example
+[template service](../deploy/flowforge@.service) and
+[template timer](../deploy/flowforge@.timer) run one registered directory-mode project
+per instance, using absolute configuration/state roots and the same locks as manual,
+TUI and Hermes commands. For a JSONL-only registration remove --sync from ExecStart.
+Customize the service user, installation paths and executable path in project JSON.
+Use a private notifications.env for credentials. Enable an instance only after
+preflight and cutover verification, for example `flowforge@smart-home.timer`.
+Cron may invoke `/opt/flowforge/flowforge run --project smart-home --max-tasks 3 --json`
+with the same explicit roots; add --sync only for a directory source. No embedded
+scheduler or daemon is needed.
+
 ## 1. Dependencies
 
 - Python 3.10+ (stdlib only for the headless path; no new packages)

@@ -34,12 +34,12 @@ There is no linter config or `pyproject.toml`/`requirements.txt`. Python 3.10+; 
 
 ## Required Environment
 
-`pipeline_runner.py` raises at import time if these are missing (no fallbacks):
+Legacy CLI/TUI entry points validate these at startup when no project is selected. Module imports and --help do not load dotenv or require project variables:
 
 - `PROJECT_DIR` — target repository where pipeline steps run (cwd for `opencode`)
 - `TASKS_FILE` — path to `tasks.jsonl`
 
-A `.env` file in the repo root is loaded automatically (simple `KEY=value` parsing, `os.environ.setdefault`). `.env`, `runs/`, and `tasks.jsonl` are gitignored — never commit them.
+In legacy mode a `.env` file in the invocation directory is loaded at startup (simple `KEY=value` parsing; process environment wins, without mutating it). `.env`, `runs/`, and `tasks.jsonl` are gitignored — never commit them.
 
 Note: `STEPS_FILE` is derived as `steps.json` next to `TASKS_FILE`; `RUNS_DIR` is a relative `runs/` dir in the current working directory. Logs are written to `runs/<timestamp>_<task_id>.log`.
 
@@ -47,7 +47,7 @@ Note: `STEPS_FILE` is derived as `steps.json` next to `TASKS_FILE`; `RUNS_DIR` i
 
 Flat modules, no packaging:
 
-- `tasks-ui.py` — Textual app. Tasks table + details panel + live events feed. Modal screens: `EditTaskScreen` (agents + run steps), `AddAgentsScreen`, `EditStepsConfigScreen`. Runner executes in a daemon thread; events are marshaled to the UI via `call_from_thread`. Entry point: `TasksUI`.
+- `tasks-ui.py` — Textual app. Tasks table + details panel + live events feed. Modal screens: `EditTaskScreen` (workflow, catalog agents + run steps), `EditStepsConfigScreen`. Runner executes in a daemon thread; events are marshaled to the UI via `call_from_thread`. Entry point: `TasksUI`.
 - `pipeline_runner.py` — headless engine. Task selection, step config normalization, `opencode run --format json` subprocess streaming, session-id/error parsing, `tasks.jsonl` persistence. Also the shared config/data layer the UI imports (all file reads/writes go through it).
 - `run-task.py` — argparse CLI: `--task-id` (single task), `--max-tasks` (batch override), `--step-timeout N` (one-off per-step timeout override, `0` = unlimited). Exit codes: 0 ok / 1 task failure / 2 config error. Takes the `runs/.flowforge.lock` flock before doing work.
 - `watch-task.py` — read-only status CLI: running tasks from `tasks.jsonl` plus active opencode sessions (incl. `task`-tool subagents via `session.parent_id`) from `~/.local/share/opencode/opencode.db`. Falls back to title matching (`{task_id}: ...`) when a task's recorded `session_id` is stale; resolves the newest `runs/*_<task_id>.log`. `--json` (`build_status`, `schema_version` 1) is the machine-readable contract consumed by `matrix-flowforge-bot` (`../matrix-flowforge-bot`): lock state, running task (id/title/stage/duration/session), all task rows (id/title/status), queue total, and `last_failed` incl. `quota_reset_at` parsed from the run log. Change the schema only with a version bump and update the bot in lockstep.
@@ -61,6 +61,17 @@ Support files:
 - `assets/` — README screenshot.
 - `deploy/` — example systemd service/timer for the headless server; `docs/headless-server.md` — server deployment guide.
 - `tests/` — stdlib `unittest` suite; `_bootstrap.py` forces isolated `PROJECT_DIR`/`TASKS_FILE` before any project import; Matrix HTTP is always mocked.
+
+## Standalone project mode
+
+- `flowforge` / `flowforge_cli.py`: registered project/config selection, doctor, sync, run, status, reset, agent import/catalog and workflow commands; JSON envelope version 1, separate from watcher v1.
+- `flowforge_config.py`: immutable RuntimeContext; precedence CLI > selected JSON > central defaults > built-ins. Legacy env adapters remain for old callers/tests. Explicit projects ignore stale legacy variables and never switch module globals/process environment.
+- `flowforge_storage.py`: canonical workspace -> queue -> runs execution locks, plus short queue mutation transactions and atomic persistence. Every interface must use these protocols. Never recover stale rows without execution locks.
+- `flowforge_sync.py`: recursive regular task.md discovery, stable relative-path IDs, source hashes/missing flags and explicit reset. Directory sources use state artifacts; JSONL keeps old output locations by default.
+- `flowforge_agents.py`: private central Markdown library, staged import with dependency/collision preview, native OPENCODE_CONFIG_DIR injection. Never commit private prompts. Real Mentory cutover remains pending unresolved dependencies; see docs/migration.md.
+- `flowforge_status.py`: read-only scoped status and workspace/queue-hashed session titles; never correlate a project using bare task IDs.
+- See docs/projects.md, docs/migration.md, docs/hermes.md. Runtime roots default to ~/.config/flowforge and ~/.local/state/flowforge; root environment overrides must be absolute.
+- Verification also compiles all new modules and runs tests/test_projects.py; optional Textual pilot tests in tests/test_project_ui.py run when Textual is installed. Existing test fixtures still patch compatibility globals for legacy engine callers.
 
 ## Key Behaviors and Invariants
 
@@ -77,7 +88,7 @@ Support files:
 - **Locking**: `acquire_lock`/`release_lock` (`pipeline_runner`) take a non-blocking flock on `RUNS_DIR/.flowforge.lock`. Used by `run-task.py` (whole run) and the TUI (per run thread); the lock holder may recover stale `running` tasks. `RUNS_DIR` honors `FLOWFORGE_RUNS_DIR` (default relative `runs/`).
 - **Legacy task fields** `steps` and `step_labels` are obsolete; the UI editor removes them on save. Do not reintroduce them.
 - **Step id validation**: ids must match `^[A-Za-z0-9_-]+$`, be unique, and have non-empty label/agent (`normalize_step_configs`).
-- **Unknown agents**: the UI prompts to append unknown agents to a step's optional `agents` list in `steps.json` (`add_known_step_agents`) before saving a task edit.
+- **Agent selection**: step `agents` lists are optional suggestions, never a whitelist. The TUI accepts any compatible effective catalog agent. New-mode workflow edits fork a project-specific copy; shared workflows are only changed explicitly.
 
 ## Conventions
 

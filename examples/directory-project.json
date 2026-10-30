@@ -1,0 +1,7 @@
+{
+  "id": "smart-home",
+  "workspace": "/srv/projects/smart-home",
+  "tasks_dir": "/srv/task-inbox/smart-home",
+  "workflow": "default",
+  "opencode_bin": "/usr/local/bin/opencode"
+}

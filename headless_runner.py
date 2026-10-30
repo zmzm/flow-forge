@@ -51,6 +51,8 @@ class TaskOutcome:
     message: str
     log_path: Optional[str]
     duration_sec: float
+    attempt_id: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 @dataclass
@@ -139,11 +141,13 @@ class _RunTracker:
         self.stage: Optional[str] = None
         self.error: Optional[str] = None
         self.log_path: Optional[str] = None
+        self.attempt_id: Optional[str] = None
 
     def __call__(self, event: Dict[str, Any]) -> None:
         kind = event.get("kind")
         if kind == "run_start":
             self.log_path = str(event.get("log_path") or "") or None
+            self.attempt_id = event.get("attempt_id")
             logger.info(
                 "Task %s started (mode=%s, steps=%s, log=%s)",
                 self.task_id,
@@ -175,6 +179,8 @@ def run_batch(
     run_task: Optional[Callable[..., pr.RunResult]] = None,
     clock: Callable[[], float] = time.monotonic,
     now: Optional[datetime] = None,
+    context=None,
+    quiet: bool = False,
 ) -> BatchOutcome:
     """Process queued tasks. With task_id set, runs exactly that one task.
 
@@ -185,18 +191,21 @@ def run_batch(
     Must run while holding the runs/.flowforge.lock flock (run-task.py does):
     it converts stale 'running' tasks (dead-process leftovers) to 'failed'.
     """
+    tasks_file = context.tasks_file if context else pr.TASKS_FILE
+    project_dir = context.workspace if context else pr.PROJECT_DIR
+    project_fields = {"project": context.project_id} if context and not context.legacy else {}
     run_one = run_task or pr.run_selected_task
     single = task_id is not None
-    max_month = None if single else pr.current_month_number(now)
+    max_month = None if single or (context and not context.month_gate) else pr.current_month_number(now)
     started = clock()
     outcomes: List[TaskOutcome] = []
     reason = "queue_empty"
     processed = 0
 
     try:
-        recovered = pr.recover_stale_running_tasks(pr.TASKS_FILE)
+        recovered = pr.recover_stale_running_tasks(tasks_file)
     except (FileNotFoundError, ValueError) as exc:
-        raise ValueError(f"Cannot read tasks file {pr.TASKS_FILE}: {exc}") from exc
+        raise ValueError(f"Cannot read tasks file {tasks_file}: {exc}") from exc
     if recovered:
         logger.info("Recovered stale running tasks (marked failed): %s", ", ".join(recovered))
 
@@ -222,9 +231,9 @@ def run_batch(
                 break
 
         try:
-            tasks = pr.read_tasks_jsonl(pr.TASKS_FILE)
+            tasks = pr.read_tasks_jsonl(tasks_file)
         except (FileNotFoundError, ValueError) as exc:
-            raise ValueError(f"Cannot read tasks file {pr.TASKS_FILE}: {exc}") from exc
+            raise ValueError(f"Cannot read tasks file {tasks_file}: {exc}") from exc
 
         idx = pr.find_task_index(tasks, task_id) if single else pr.find_next_todo(tasks, max_month)
         if idx is None:
@@ -238,10 +247,11 @@ def run_batch(
 
         task = tasks[idx]
         selected_id = str(task.get("id") or f"task{idx + 1}")
-        title = task_title(task, pr.PROJECT_DIR)
+        title = task_title(task, project_dir)
         logger.info("Task selected: %s", selected_id)
         notifier.task_started(
             {
+                **project_fields,
                 "id": selected_id,
                 "title": title,
                 "status": task.get("status"),
@@ -254,7 +264,8 @@ def run_batch(
         result: Optional[pr.RunResult] = None
         failure: Optional[BaseException] = None
         try:
-            result = run_one(task_id=selected_id, callback=tracker)
+            kwargs = {"context": context} if context and run_task is None else {}
+            result = run_one(task_id=selected_id, callback=tracker, **kwargs)
         except Exception as exc:
             failure = exc
             logger.exception("Task %s raised an exception", selected_id)
@@ -263,16 +274,17 @@ def run_batch(
         if result is not None and result.ok:
             message = result.message
             log_path = str(result.log_path) if result.log_path else None
-            print(message)
-            if log_path:
-                print(f"Log: {log_path}")
-            if result.session_id:
-                print(f"Session: {result.session_id}")
+            if not quiet:
+                print(message)
+                if log_path:
+                    print(f"Log: {log_path}")
+                if result.session_id:
+                    print(f"Session: {result.session_id}")
             notifier.task_completed(
-                {"id": selected_id, "title": title},
+                {**project_fields, "id": selected_id, "title": title},
                 {"status": "done", "duration_sec": duration, "log_path": log_path},
             )
-            outcomes.append(TaskOutcome(selected_id, title, True, message, log_path, duration))
+            outcomes.append(TaskOutcome(selected_id, title, True, message, log_path, duration, result.attempt_id, result.session_id))
         else:
             if result is not None:
                 message = result.message
@@ -283,7 +295,7 @@ def run_batch(
             logger.error("Task %s failed: %s", selected_id, message[:LOG_TEXT_LIMIT])
             stage = result.stage if (result is not None and result.stage) else tracker.stage
             notifier.task_failed(
-                {"id": selected_id, "title": title},
+                {**project_fields, "id": selected_id, "title": title},
                 {
                     "stage": stage,
                     "message": tracker.error or message,
@@ -291,8 +303,15 @@ def run_batch(
                     "log_path": log_path,
                 },
             )
-            outcomes.append(TaskOutcome(selected_id, title, False, message, log_path, duration))
+            outcomes.append(TaskOutcome(selected_id, title, False, message, log_path, duration, result.attempt_id if result else tracker.attempt_id, result.session_id if result else None))
 
+        if context:
+            from flowforge_storage import append_history
+            append_history(tasks_file, selected_id, {
+                "attempt_id": result.attempt_id if result else tracker.attempt_id,
+                "ok": outcomes[-1].ok, "message": message, "log_path": log_path,
+                "duration_sec": duration, "session_id": result.session_id if result else None,
+            })
         processed += 1
         if not outcomes[-1].ok and config.stop_on_failure:
             reason = "stop_on_failure"
@@ -302,6 +321,8 @@ def run_batch(
     if outcomes:
         notifier.run_completed(
             {
+                **project_fields,
+                "reason": reason,
                 "results": [
                     {"id": o.task_id, "title": o.title, "ok": o.ok} for o in outcomes
                 ],
@@ -315,10 +336,12 @@ def run_batch(
         message = (
             f"No active tasks for month f{max_month}; {held} future task(s) on hold."
         )
-        print(message)
+        if not quiet:
+            print(message)
         logger.info("Month gate: stopping (%s)", message)
         notifier.run_completed(
             {
+                **project_fields,
                 "results": [],
                 "completed": 0,
                 "failed": 0,
@@ -328,7 +351,8 @@ def run_batch(
             }
         )
     elif reason == "queue_empty":
-        print("No TODO tasks.")
+        if not quiet:
+            print("No TODO tasks.")
     logger.info(
         "Batch finished: reason=%s processed=%d completed=%d failed=%d duration=%.0fs",
         reason,

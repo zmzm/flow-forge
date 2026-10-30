@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily FlowForge batch for project %i
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=flowforge@%i.service
+
+[Install]
+WantedBy=timers.target

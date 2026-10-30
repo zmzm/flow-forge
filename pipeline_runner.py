@@ -13,36 +13,11 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, IO, List, Optional, Tuple
-
-
-def _load_dotenv_if_present(dotenv_path: Path) -> None:
-    if not dotenv_path.exists():
-        return
-    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if not key:
-            continue
-        if len(value) >= 2 and ((value[0] == value[-1]) and value[0] in {"\"", "'"}):
-            value = value[1:-1]
-        os.environ.setdefault(key, value)
-
-
-_load_dotenv_if_present(Path(".env"))
-
-def _require_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
 
 
 def _optional_int_env(name: str, default: Optional[int]) -> Optional[int]:
@@ -56,9 +31,9 @@ def _optional_int_env(name: str, default: Optional[int]) -> Optional[int]:
     return value if value > 0 else None
 
 
-PROJECT_DIR = Path(_require_env("PROJECT_DIR")).expanduser()
-TASKS_FILE = Path(_require_env("TASKS_FILE")).expanduser()
-STEPS_FILE = TASKS_FILE.with_name("steps.json")
+PROJECT_DIR = Path(os.environ["PROJECT_DIR"]).expanduser() if os.environ.get("PROJECT_DIR") else None
+TASKS_FILE = Path(os.environ["TASKS_FILE"]).expanduser() if os.environ.get("TASKS_FILE") else None
+STEPS_FILE = TASKS_FILE.with_name("steps.json") if TASKS_FILE else None
 RUNS_DIR = Path(os.getenv("FLOWFORGE_RUNS_DIR", "runs")).expanduser()
 
 DEFAULT_STEP_CONFIGS = [
@@ -68,6 +43,7 @@ DEFAULT_STEP_CONFIGS = [
 ]
 SUPPORTED_STEP_IDS = {step["id"] for step in DEFAULT_STEP_CONFIGS}
 STEP_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$")
 
 # Models are normally selected by each OpenCode agent's frontmatter. A model in
 # steps.json is an explicit per-step override; there is no global CLI override.
@@ -75,8 +51,8 @@ MODEL: Optional[str] = None
 VARIANT: Optional[str] = None
 USE_ATTACH = False
 ATTACH_URL = "http://localhost:4096"
-STEP_TIMEOUT_SEC: Optional[int] = _optional_int_env("FLOWFORGE_STEP_TIMEOUT_SECONDS", 3600)
-HEARTBEAT_SEC: Optional[int] = _optional_int_env("FLOWFORGE_HEARTBEAT_SECONDS", 30)
+STEP_TIMEOUT_SEC: Optional[int] = 3600
+HEARTBEAT_SEC: Optional[int] = 30
 SHARE_SESSION = False
 
 EventCallback = Optional[Callable[[Dict[str, Any]], None]]
@@ -90,6 +66,7 @@ class RunResult:
     log_path: Optional[Path]
     message: str
     stage: Optional[str] = None
+    attempt_id: Optional[str] = None
 
 
 class RunControl:
@@ -125,66 +102,61 @@ def read_tasks_jsonl(path: Path) -> List[Dict[str, Any]]:
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if line:
-            tasks.append(json.loads(line))
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ValueError(f"Queue line must be a JSON object: {path}")
+            tasks.append(value)
     return tasks
 
 
 def write_tasks_jsonl(path: Path, tasks: List[Dict[str, Any]]) -> None:
+    from flowforge_storage import atomic_text
     data = "\n".join(json.dumps(t, ensure_ascii=False) for t in tasks) + "\n"
-    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    try:
-        with tmp_path.open("w", encoding="utf-8") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
+    atomic_text(path, data)
 
 
 def _persist_task_update(path: Path, idx: int, task_id: str, updates: Dict[str, Any]) -> None:
     """Merge a task's field updates into a freshly read tasks.jsonl (atomic)."""
-    tasks = read_tasks_jsonl(path)
-    pos = find_task_index(tasks, task_id)
-    if pos is None and 0 <= idx < len(tasks):
-        pos = idx
-    if pos is None:
-        tasks.append({"id": task_id, **updates})
-    else:
+    from flowforge_storage import file_transaction
+    with file_transaction(path):
+        tasks = read_tasks_jsonl(path)
+        pos = find_task_index(tasks, task_id)
+        if pos is None:
+            tasks.append({"id": task_id})
+            pos = len(tasks) - 1
+        if "outputs" in updates:
+            updates = {**updates, "outputs": {**tasks[pos].get("outputs", {}), **updates["outputs"]}}
         tasks[pos].update(updates)
-    write_tasks_jsonl(path, tasks)
+        write_tasks_jsonl(path, tasks)
 
 
 def recover_stale_running_tasks(path: Path) -> List[str]:
     """Mark 'running' tasks (left over from a dead process) as failed so they auto-resume."""
-    try:
-        tasks = read_tasks_jsonl(path)
-    except (FileNotFoundError, ValueError):
+    from flowforge_storage import file_transaction
+    if not path.exists():
         return []
-    recovered: List[str] = []
-    changed = False
-    for task in tasks:
-        if str(task.get("status", "")) == "running":
-            task["status"] = "failed"
-            recovered.append(str(task.get("id") or "-"))
-            changed = True
-    if changed:
-        write_tasks_jsonl(path, tasks)
-    return recovered
+    with file_transaction(path):
+        tasks = read_tasks_jsonl(path)
+        recovered = []
+        for task in tasks:
+            if task.get("status") == "running":
+                task["status"] = "failed"
+                recovered.append(str(task.get("id") or "-"))
+        if recovered:
+            write_tasks_jsonl(path, tasks)
+        return recovered
 
 
 def acquire_lock(path: Path) -> Optional[IO[str]]:
     path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(path, "w", encoding="utf-8")
+    handle = open(path, "a+", encoding="utf-8")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         handle.close()
         return None
+    handle.seek(0)
+    handle.truncate()
     handle.write(f"{os.getpid()}\n")
     handle.flush()
     return handle
@@ -235,6 +207,8 @@ def normalize_step_configs(raw_steps: Any, source: str = "steps config") -> List
             raise ValueError(f"Step label cannot be empty for '{step_id}' in {source}")
         if not agent:
             raise ValueError(f"Step agent cannot be empty for '{step_id}' in {source}")
+        if not AGENT_ID_RE.fullmatch(agent):
+            raise ValueError(f"Invalid agent identifier for step {step_id}: {agent!r}")
         if not isinstance(extra_agents, list):
             raise ValueError(f"Step agents must be a list for '{step_id}' in {source}")
 
@@ -250,8 +224,9 @@ def normalize_step_configs(raw_steps: Any, source: str = "steps config") -> List
     return configs
 
 
-def read_step_configs(path: Path = STEPS_FILE) -> List[Dict[str, Any]]:
-    if not path.exists():
+def read_step_configs(path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    path = path or STEPS_FILE
+    if path is None or not path.exists():
         return [dict(step) for step in DEFAULT_STEP_CONFIGS]
 
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -259,7 +234,10 @@ def read_step_configs(path: Path = STEPS_FILE) -> List[Dict[str, Any]]:
     return normalize_step_configs(raw_steps, str(path))
 
 
-def write_step_configs(step_configs: List[Dict[str, Any]], path: Path = STEPS_FILE) -> None:
+def write_step_configs(step_configs: List[Dict[str, Any]], path: Optional[Path] = None) -> None:
+    path = path or STEPS_FILE
+    if path is None:
+        raise ValueError("No workflow file selected")
     serializable = []
     for step in step_configs:
         item = {
@@ -274,7 +252,9 @@ def write_step_configs(step_configs: List[Dict[str, Any]], path: Path = STEPS_FI
         if agents:
             item["agents"] = agents
         serializable.append(item)
-    path.write_text(json.dumps({"steps": serializable}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    from flowforge_storage import atomic_json, file_transaction
+    with file_transaction(path):
+        atomic_json(path, {"steps": serializable})
 
 
 def step_known_agents(step: Dict[str, Any]) -> List[str]:
@@ -300,7 +280,7 @@ def unknown_task_agents(
 
 def add_known_step_agents(
     additions: List[Dict[str, str]],
-    path: Path = STEPS_FILE,
+    path: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     configs = read_step_configs(path)
     by_id = {step["id"]: step for step in configs}
@@ -327,14 +307,20 @@ def task_agents(task: Dict[str, Any], step_configs: Optional[List[Dict[str, Any]
     overrides = task.get("agents") or {}
     if not isinstance(overrides, dict):
         raise ValueError("Task field 'agents' must be an object if provided")
-    return {
+    result = {
         step["id"]: str(overrides.get(step["id"]) or step["agent"])
         for step in (step_configs if step_configs is not None else read_step_configs())
     }
 
+    for agent in result.values():
+        if not AGENT_ID_RE.fullmatch(agent):
+            raise ValueError(f"Invalid agent identifier: {agent!r}")
+    return result
 
-def agent_configured_model(agent: str, project_dir: Path = PROJECT_DIR) -> Optional[str]:
+
+def agent_configured_model(agent: str, project_dir: Optional[Path] = None) -> Optional[str]:
     """Best-effort lookup of the model declared in an OpenCode agent file."""
+    project_dir = project_dir or PROJECT_DIR or Path.cwd()
     candidates = [
         project_dir / ".opencode" / "agents" / f"{agent}.md",
         Path.home() / ".config" / "opencode" / "agents" / f"{agent}.md",
@@ -453,8 +439,9 @@ def build_cmd_base(
     files: List[Path],
     model: Optional[str] = None,
     cwd: Optional[Path] = None,
+    executable: Optional[str] = None,
 ) -> List[str]:
-    cmd = [opencode_bin(), "run", "--format", "json", "--print-logs", "--log-level", "ERROR"]
+    cmd = [executable or opencode_bin(), "run", "--format", "json", "--print-logs", "--log-level", "ERROR"]
     if cwd:
         # OpenCode may use the inherited PWD instead of the subprocess cwd when
         # resolving the project. Be explicit so sessions belong to PROJECT_DIR.
@@ -540,26 +527,26 @@ def step_output_file(step_id: str, task_dir: Path) -> Path:
 
 
 def step_message(step_id: str, label: str, output_file: Path) -> str:
-    output_name = output_file.name
+    output_name = str(output_file.resolve())
     if step_id == "concept":
         return (
             "Read the attached task file and produce a CONCEPT PLAN.\n"
             "Hard requirements:\n"
-            f"- Save your output ONLY to a file named '{output_name}' in the SAME DIRECTORY as the task file.\n"
+            f"- Save your output ONLY to the absolute path '{output_name}'.\n"
             f"After writing the file, briefly confirm that '{output_name}' was created."
         )
     if step_id == "grounded":
         return (
             "Read ONLY the attached previous plan and produce a GROUNDED PLAN.\n"
             "Hard requirements:\n"
-            f"- Save your output ONLY to '{output_name}' in the SAME DIRECTORY as the previous plan.\n"
+            f"- Save your output ONLY to '{output_name}' at that absolute path.\n"
             f"After writing the file, briefly confirm that '{output_name}' was created."
         )
     if step_id == "execution":
         return (
             "Read ONLY the attached previous plan and execute it in the repository.\n"
             "Hard requirements:\n"
-            f"- At the end, save a concise execution report ONLY to '{output_name}' in the SAME DIRECTORY as the previous plan.\n"
+            f"- At the end, save a concise execution report ONLY to '{output_name}' at that absolute path.\n"
             "The execution report must include:\n"
             "- What files were changed (paths)\n"
             "- What endpoints/DTOs were added or updated\n"
@@ -570,7 +557,7 @@ def step_message(step_id: str, label: str, output_file: Path) -> str:
     return (
         f"Read ONLY the attached input and produce this pipeline step: {label}.\n"
         "Hard requirements:\n"
-        f"- Save your output ONLY to '{output_name}' in the SAME DIRECTORY as the attached input.\n"
+        f"- Save your output ONLY to '{output_name}' at that absolute path.\n"
         f"After writing the file, briefly confirm that '{output_name}' was created."
     )
 
@@ -582,17 +569,25 @@ def build_pipeline_steps(
     concept_plan_file: Path,
     grounded_plan_file: Path,
     execution_file: Path,
+    context=None,
 ) -> List[Dict[str, Any]]:
-    step_configs = read_step_configs()
+    step_configs = context.steps(task) if context else read_step_configs()
     agents = task_agents(task, step_configs)
     task_dir = task_file.parent
+    if context and context.artifacts_dir:
+        from flowforge_sync import source_id
+        task_dir = context.artifacts_dir / source_id(task.get("source_key", str(task["id"])))
+    effective_catalog = None
+    if context and not context.legacy:
+        from flowforge_agents import validate_agents
+        effective_catalog = validate_agents(context, agents.values())
     input_file = task_file
     steps: List[Dict[str, Any]] = []
     for step in step_configs:
         step_id = step["id"]
         output_file = step_output_file(step_id, task_dir)
         model_override = str(step.get("model") or "").strip() or None
-        configured_model = agent_configured_model(agents[step_id])
+        configured_model = effective_catalog[agents[step_id]]["model"] if effective_catalog is not None else agent_configured_model(agents[step_id], context.workspace if context else None)
         steps.append(
             {
                 "id": step_id,
@@ -635,8 +630,12 @@ def run_opencode_step_stream(
     control: Optional[RunControl] = None,
     title: Optional[str] = None,
     session_id: Optional[str] = None,
+    context=None,
+    environment: Optional[dict] = None,
 ) -> Tuple[int, str, Optional[str], bool]:
-    cmd = build_cmd_base(files, model=model, cwd=cwd) + ["--agent", agent]
+    timeout = context.step_timeout if context else STEP_TIMEOUT_SEC
+    heartbeat = context.heartbeat if context else HEARTBEAT_SEC
+    cmd = build_cmd_base(files, model=model, cwd=cwd, executable=context.opencode if context else None) + ["--agent", agent]
     if title:
         cmd += ["--title", title]
     if session_id:
@@ -650,7 +649,7 @@ def run_opencode_step_stream(
     proc = subprocess.Popen(
         cmd,
         cwd=str(cwd),
-        env={**os.environ, "PWD": str(cwd)},
+        env={**os.environ, **(environment or {}), "PWD": str(cwd)},
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -670,7 +669,7 @@ def run_opencode_step_stream(
         kill_timer.daemon = True
         kill_timer.start()
 
-    timer = threading.Timer(STEP_TIMEOUT_SEC, _expire) if STEP_TIMEOUT_SEC else None
+    timer = threading.Timer(timeout, _expire) if timeout else None
     if timer:
         timer.daemon = True
         timer.start()
@@ -680,12 +679,12 @@ def run_opencode_step_stream(
     stop_beat = threading.Event()
 
     def _heartbeat() -> None:
-        assert HEARTBEAT_SEC is not None
+        assert heartbeat is not None
         last_beat = time.monotonic()
         prev_stat: Optional[Tuple[float, int]] = None
-        while not stop_beat.wait(HEARTBEAT_SEC):
+        while not stop_beat.wait(heartbeat):
             now = time.monotonic()
-            if now - last_activity[0] < HEARTBEAT_SEC:
+            if now - last_activity[0] < heartbeat:
                 continue
             alive = proc.poll() is None
             stat = _proc_stat_snapshot(proc.pid) if alive else None
@@ -707,7 +706,7 @@ def run_opencode_step_stream(
             except OSError:
                 pass
 
-    beat_thread = threading.Thread(target=_heartbeat, daemon=True) if HEARTBEAT_SEC else None
+    beat_thread = threading.Thread(target=_heartbeat, daemon=True) if heartbeat else None
     if beat_thread:
         beat_thread.start()
 
@@ -740,6 +739,9 @@ def run_opencode_step_stream(
         stop_beat.set()
         if timer:
             timer.cancel()
+        proc.stdout.close()
+        if beat_thread:
+            beat_thread.join(timeout=1)
     if control:
         control.set_active_proc(None)
     out_all = "\n".join(raw) + "\n"
@@ -760,11 +762,16 @@ def run_selected_task(
     task_id: Optional[str] = None,
     callback: EventCallback = None,
     control: Optional[RunControl] = None,
+    context=None,
 ) -> RunResult:
-    require_exists(PROJECT_DIR, "PROJECT_DIR does not exist")
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    if context is None:
+        from flowforge_config import legacy_context
+        context = legacy_context(load_dotenv=False)
+    project_dir, tasks_file, runs_dir = context.workspace, context.tasks_file, context.runs_dir
+    require_exists(project_dir, "project_dir does not exist")
+    runs_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = read_tasks_jsonl(TASKS_FILE)
+    tasks = read_tasks_jsonl(tasks_file)
     idx = find_task_index(tasks, task_id) if task_id else find_next_todo(tasks)
     if idx is None:
         msg = f"Task id not found: {task_id}" if task_id else "No TODO tasks."
@@ -775,8 +782,25 @@ def run_selected_task(
     if "task_file" not in task:
         raise ValueError(f"Task {selected_id} missing 'task_file'")
 
-    task_file = resolve_file(task["task_file"], PROJECT_DIR)
+    task_file = resolve_file(task["task_file"], project_dir)
     require_exists(task_file, "Task file not found")
+    if context.tasks_dir:
+        import hashlib
+        source_root = context.tasks_dir.resolve()
+        if not task_file.resolve().is_relative_to(source_root):
+            raise ValueError(f"Task source escapes configured tree: {task_file}")
+        relative = task_file.relative_to(source_root)
+        current = source_root
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError(f"Task source is a symlink: {current}")
+        if task.get("source_hash") != hashlib.sha256(task_file.read_bytes()).hexdigest():
+            raise ValueError(f"Task source changed; sync and explicitly reset: {selected_id}")
+    if task.get("source_missing"):
+        raise ValueError(f"Task source disappeared; sync before running: {selected_id}")
+    if task.get("source_changed"):
+        raise ValueError(f"Task source changed; explicitly reset before running: {selected_id}")
     task_dir = task_file.parent
     concept_plan_file = task_dir / "concept-plan.md"
     grounded_plan_file = task_dir / "grounded-plan.md"
@@ -787,12 +811,21 @@ def run_selected_task(
         concept_plan_file=concept_plan_file,
         grounded_plan_file=grounded_plan_file,
         execution_file=execution_file,
+        context=context,
     )
     steps, run_mode = select_steps_for_task(task, all_steps)
 
-    run_id = f'{datetime.now().strftime("%Y%m%d_%H%M%S")}_{selected_id}'
-    log_path = RUNS_DIR / f"{run_id}.log"
-    title = f"{selected_id}: {task_file.name}"
+    log_task_id = re.sub(r"[^A-Za-z0-9_-]", "_", selected_id)
+    run_id = f'{datetime.now().strftime("%Y%m%d_%H%M%S")}_{uuid.uuid4().hex}_{log_task_id}'
+    log_path = runs_dir / f"{run_id}.log"
+    from flowforge_status import session_prefix
+    title = f"{selected_id}: {task_file.name}" if context.legacy else f"{session_prefix(context)}{selected_id}: {task_file.name}"
+    environment = {}
+    if not context.legacy:
+        from flowforge_agents import prepare_opencode
+        environment = prepare_opencode(context, runs_dir / (run_id + ".opencode"))
+    for step in all_steps:
+        step["output_file"].parent.mkdir(parents=True, exist_ok=True)
     session_id: Optional[str] = None
     resume_session_id: Optional[str] = None
     if task.get("status") == "failed":
@@ -800,13 +833,15 @@ def run_selected_task(
     failed_stage: Optional[str] = None
 
     task["status"] = "running"
-    _persist_task_update(TASKS_FILE, idx, selected_id, {"status": "running"})
+    _persist_task_update(tasks_file, idx, selected_id, {"status": "running", "attempt_id": run_id, "last_run_log": str(log_path), "execution_workspace": str(project_dir), "execution_project": context.project_id, "stage": None})
 
     emit(
         callback,
         {
             "kind": "run_start",
             "task_id": selected_id,
+            "attempt_id": run_id,
+            "project": context.project_id,
             "model": "per-agent",
             "steps_total": len(steps),
             "run_mode": run_mode,
@@ -822,7 +857,7 @@ def run_selected_task(
                 encoding="utf-8",
             )
             _persist_task_update(
-                TASKS_FILE,
+                tasks_file,
                 idx,
                 selected_id,
                 {
@@ -832,7 +867,7 @@ def run_selected_task(
                 },
             )
             emit(callback, {"kind": "run_done", "ok": True, "task_id": selected_id, "session_id": session_id})
-            return RunResult(True, selected_id, session_id, log_path, f"Task {selected_id} -> already complete")
+            return RunResult(True, selected_id, session_id, log_path, f"Task {selected_id} -> already complete", attempt_id=run_id)
         ok = False
         emit(callback, {"kind": "error", "text": "No steps selected"})
 
@@ -847,6 +882,7 @@ def run_selected_task(
 
             label = str(step["label"])
             failed_stage = label
+            _persist_task_update(tasks_file, idx, selected_id, {"stage": label, "stage_id": step["id"]})
             input_file: Path = step["input_file"]
             output_file: Path = step["output_file"]
             agent = str(step["agent"])
@@ -875,15 +911,19 @@ def run_selected_task(
                 model=model,
                 message=str(step["message"]),
                 files=[input_file],
-                cwd=PROJECT_DIR,
+                cwd=project_dir,
                 log_path=log_path,
                 callback=callback,
                 control=control,
                 title=title,
                 session_id=resume_session_id,
+                context=context,
+                environment=environment,
             )
             resume_session_id = None
             session_id = sid or session_id
+            if session_id:
+                _persist_task_update(tasks_file, idx, selected_id, {"session_id": session_id})
 
             provider_error = parse_opencode_error_from_json_events(step_output)
             if rc != 0 or provider_error or not output_file.exists():
@@ -892,7 +932,7 @@ def run_selected_task(
                     emit(callback, {"kind": "error", "text": "Run stopped by user"})
                     break
                 if step_timed_out:
-                    error_text = f"Step '{label}' timed out after {STEP_TIMEOUT_SEC}s and was terminated"
+                    error_text = f"Step '{label}' timed out after {context.step_timeout}s and was terminated"
                 elif provider_error:
                     error_text = f"Step '{label}' failed: {provider_error}"
                 elif rc != 0:
@@ -909,7 +949,7 @@ def run_selected_task(
             )
     except BaseException:
         _persist_task_update(
-            TASKS_FILE,
+            tasks_file,
             idx,
             selected_id,
             {"status": "failed", "last_run_log": str(log_path), "session_id": session_id},
@@ -918,23 +958,23 @@ def run_selected_task(
 
     if not ok:
         _persist_task_update(
-            TASKS_FILE,
+            tasks_file,
             idx,
             selected_id,
             {"status": "failed", "last_run_log": str(log_path), "session_id": session_id},
         )
         emit(callback, {"kind": "run_done", "ok": False, "task_id": selected_id, "session_id": session_id})
         if control and control.stop_requested:
-            return RunResult(False, selected_id, session_id, log_path, f"Task {selected_id} -> stopped", failed_stage)
-        return RunResult(False, selected_id, session_id, log_path, f"Task {selected_id} -> failed", failed_stage)
+            return RunResult(False, selected_id, session_id, log_path, f"Task {selected_id} -> stopped", failed_stage, run_id)
+        return RunResult(False, selected_id, session_id, log_path, f"Task {selected_id} -> failed", failed_stage, run_id)
 
     outputs = task.get("outputs") if isinstance(task.get("outputs"), dict) else {}
     outputs.update({str(step["id"]): str(step["output_file"]) for step in steps})
     _persist_task_update(
-        TASKS_FILE,
+        tasks_file,
         idx,
         selected_id,
-        {"status": "done", "session_id": session_id, "last_run_log": str(log_path), "outputs": outputs},
+        {"status": "done", "session_id": session_id, "last_run_log": str(log_path), "outputs": outputs, "stage": None},
     )
     emit(callback, {"kind": "run_done", "ok": True, "task_id": selected_id, "session_id": session_id})
-    return RunResult(True, selected_id, session_id, log_path, f"Task {selected_id} -> done")
+    return RunResult(True, selected_id, session_id, log_path, f"Task {selected_id} -> done", attempt_id=run_id)

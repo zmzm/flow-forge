@@ -1,0 +1,14 @@
+[Unit]
+Description=FlowForge batch for project %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=flowforge
+Environment=FLOWFORGE_CONFIG_DIR=/etc/flowforge
+Environment=FLOWFORGE_STATE_DIR=/var/lib/flowforge
+EnvironmentFile=-/etc/flowforge/notifications.env
+ExecStart=/usr/bin/python3 /opt/flowforge/flowforge run --project %i --sync --max-tasks 3 --json
+TimeoutStartSec=infinity
+KillMode=control-group

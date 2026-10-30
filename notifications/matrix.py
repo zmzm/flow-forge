@@ -31,6 +31,8 @@ def format_duration(seconds: float) -> str:
 
 def task_line(task: Dict[str, Any]) -> str:
     task_id = str(task.get("id") or "-")
+    if task.get("project"):
+        task_id = f"[{task['project']}] {task_id}"
     title = str(task.get("title") or "").strip()
     return f"{task_id} — {title}" if title else task_id
 
@@ -120,6 +122,8 @@ class MatrixNotifier(Notifier):
 
     def run_completed(self, summary: Dict[str, Any]) -> None:
         lines = ["🌙 FlowForge run finished"]
+        if summary.get("project"):
+            lines.append(f"Project: {summary['project']}")
         for item in summary.get("results", []):
             mark = "✅" if item.get("ok") else "❌"
             lines.append(f"{mark} {task_line(item)}")
