@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Compatibility CLI: legacy environment or explicitly selected FlowForge project."""
+
 import sys
+
 from flowforge_cli import main
 
 if __name__ == "__main__":

@@ -38,6 +38,32 @@ Private agent prompts must remain outside this public repository.
    additive; do not replace the queue with an old backup after useful work without
    reconciling new results. Keep current logs and imported library backups.
 
+## Checkpoint and module upgrade
+
+Back up queues and artifacts before upgrading a worker installation. Successful
+steps now persist checkpoints immediately, including source/workflow fingerprints
+and input/output hashes. Failed tasks resume from the first checkpoint that cannot
+be verified. A partial file left by a failed step is not treated as completed work.
+
+Older failed rows without checkpoints rerun their unverified steps even if plan or
+report files already exist. Review those attempts on a disposable copy before
+resuming work that changes a repository. Preserve the queue and artifacts; do not
+invent checkpoints or delete outputs to make a task appear resumable. Existing
+`run_steps` remains an explicit selection and takes precedence over automatic resume.
+Saved sessions are reused only for the first resumed step and are discarded when
+the recorded step or revision differs.
+
+The existing launch commands remain available. Python callers should import the
+UI from `flowforge_ui` and the watcher from `flowforge_watch`; the hyphenated scripts
+are compatibility launchers. Shared execution results live in `flowforge_models`,
+with legacy runner re-exports retained. The watcher and project CLI keep their
+separate schema-version-1 contracts.
+
+For an interactive installation, install `requirements-ui.txt`. Development checks
+use `requirements-dev.txt` and `python scripts/check.py`; headless installation
+checks use `python scripts/check.py --stdlib-only`. See the
+[development guide](development.md) for commands and CI coverage.
+
 ## Import the complete Mentori library
 
 The local implementation audit found **11 Markdown agents**, rather than the

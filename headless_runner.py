@@ -9,12 +9,14 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
 
 import pipeline_runner as pr
+from flowforge_execution import ConfigurationError
 from notifications import Notifier
 from notifications.base import parse_bool
 
@@ -29,7 +31,6 @@ DEFAULT_MAX_RUNTIME_SECONDS = 14400
 
 EXIT_OK = 0
 EXIT_TASK_FAILED = 1
-EXIT_CONFIG = 2
 
 TITLE_MAX_CHARS = 100
 TITLE_READ_CHARS = 4096
@@ -46,18 +47,18 @@ class BatchConfig:
 @dataclass
 class TaskOutcome:
     task_id: str
-    title: Optional[str]
+    title: str | None
     ok: bool
     message: str
-    log_path: Optional[str]
+    log_path: str | None
     duration_sec: float
-    attempt_id: Optional[str] = None
-    session_id: Optional[str] = None
+    attempt_id: str | None = None
+    session_id: str | None = None
 
 
 @dataclass
 class BatchOutcome:
-    outcomes: List[TaskOutcome] = field(default_factory=list)
+    outcomes: list[TaskOutcome] = field(default_factory=list)
     reason: str = "queue_empty"
     duration_sec: float = 0.0
 
@@ -74,7 +75,7 @@ class BatchOutcome:
         return EXIT_TASK_FAILED if self.failed else EXIT_OK
 
 
-def _int_env(env: Dict[str, str], name: str, default: int, minimum: int) -> int:
+def _int_env(env: dict[str, str], name: str, default: int, minimum: int) -> int:
     raw = str(env.get(name, "")).strip()
     if not raw:
         return default
@@ -88,10 +89,10 @@ def _int_env(env: Dict[str, str], name: str, default: int, minimum: int) -> int:
 
 
 def batch_config_from_env(
-    env: Optional[Dict[str, str]] = None,
-    max_tasks_override: Optional[int] = None,
+    env: dict[str, str] | None = None,
+    max_tasks_override: int | None = None,
 ) -> BatchConfig:
-    env = os.environ if env is None else dict(env)
+    env = dict(os.environ if env is None else env)
     if max_tasks_override is not None:
         if max_tasks_override < 1:
             raise ValueError("--max-tasks must be >= 1")
@@ -108,7 +109,7 @@ def batch_config_from_env(
     )
 
 
-def task_title(task: Dict[str, Any], project_dir: Path) -> Optional[str]:
+def task_title(task: dict[str, Any], project_dir: Path) -> str | None:
     """Best-effort task title: first Markdown heading of the task file."""
     raw = task.get("task_file")
     if not raw:
@@ -138,12 +139,12 @@ class _RunTracker:
 
     def __init__(self, task_id: str) -> None:
         self.task_id = task_id
-        self.stage: Optional[str] = None
-        self.error: Optional[str] = None
-        self.log_path: Optional[str] = None
-        self.attempt_id: Optional[str] = None
+        self.stage: str | None = None
+        self.error: str | None = None
+        self.log_path: str | None = None
+        self.attempt_id: str | None = None
 
-    def __call__(self, event: Dict[str, Any]) -> None:
+    def __call__(self, event: dict[str, Any]) -> None:
         kind = event.get("kind")
         if kind == "run_start":
             self.log_path = str(event.get("log_path") or "") or None
@@ -175,12 +176,13 @@ class _RunTracker:
 def run_batch(
     config: BatchConfig,
     notifier: Notifier,
-    task_id: Optional[str] = None,
-    run_task: Optional[Callable[..., pr.RunResult]] = None,
+    task_id: str | None = None,
+    run_task: Callable[..., pr.RunResult] | None = None,
     clock: Callable[[], float] = time.monotonic,
-    now: Optional[datetime] = None,
+    now: datetime | None = None,
     context=None,
     quiet: bool = False,
+    execution=None,
 ) -> BatchOutcome:
     """Process queued tasks. With task_id set, runs exactly that one task.
 
@@ -188,22 +190,51 @@ def run_batch(
     prefix f<N>, N = months since MONTH_BASE_YEAR); ids without that prefix
     stay eligible. When only future-month tasks remain, the batch stops.
 
-    Must run while holding the runs/.flowforge.lock flock (run-task.py does):
-    it converts stale 'running' tasks (dead-process leftovers) to 'failed'.
+    Owns execution locks unless an existing execution lease is supplied.
+    Injected run_task callbacks remain a scheduling-only test seam.
     """
+    if execution is not None:
+        if context is not None and context != execution.context:
+            raise ValueError("Batch context differs from its execution lease")
+        context = execution.context
+    if execution is None and run_task is None:
+        from flowforge_config import legacy_context
+        from flowforge_execution import Execution
+
+        context = context or legacy_context(load_dotenv=False)
+        execution = Execution.open(context)
+        if execution is None:
+            return BatchOutcome(reason="busy")
+        try:
+            return run_batch(
+                config,
+                notifier,
+                task_id,
+                clock=clock,
+                now=now,
+                context=context,
+                quiet=quiet,
+                execution=execution,
+            )
+        finally:
+            execution.close()
     tasks_file = context.tasks_file if context else pr.TASKS_FILE
     project_dir = context.workspace if context else pr.PROJECT_DIR
+    if tasks_file is None or project_dir is None:
+        raise ValueError("Legacy mode requires PROJECT_DIR and TASKS_FILE, or select a project")
     project_fields = {"project": context.project_id} if context and not context.legacy else {}
-    run_one = run_task or pr.run_selected_task
+    run_one = run_task or execution.run_task
     single = task_id is not None
-    max_month = None if single or (context and not context.month_gate) else pr.current_month_number(now)
+    max_month = (
+        None if single or (context and not context.month_gate) else pr.current_month_number(now)
+    )
     started = clock()
-    outcomes: List[TaskOutcome] = []
+    outcomes: list[TaskOutcome] = []
     reason = "queue_empty"
     processed = 0
 
     try:
-        recovered = pr.recover_stale_running_tasks(tasks_file)
+        recovered = execution.recover() if execution else pr.recover_stale_running_tasks(tasks_file)
     except (FileNotFoundError, ValueError) as exc:
         raise ValueError(f"Cannot read tasks file {tasks_file}: {exc}") from exc
     if recovered:
@@ -235,7 +266,11 @@ def run_batch(
         except (FileNotFoundError, ValueError) as exc:
             raise ValueError(f"Cannot read tasks file {tasks_file}: {exc}") from exc
 
-        idx = pr.find_task_index(tasks, task_id) if single else pr.find_next_todo(tasks, max_month)
+        idx = (
+            pr.find_task_index(tasks, task_id)
+            if task_id is not None
+            else pr.find_next_todo(tasks, max_month)
+        )
         if idx is None:
             if single:
                 raise ValueError(f"Task id not found: {task_id}")
@@ -261,11 +296,12 @@ def run_batch(
 
         tracker = _RunTracker(selected_id)
         task_started_at = clock()
-        result: Optional[pr.RunResult] = None
-        failure: Optional[BaseException] = None
+        result: pr.RunResult | None = None
+        failure: BaseException | None = None
         try:
-            kwargs = {"context": context} if context and run_task is None else {}
-            result = run_one(task_id=selected_id, callback=tracker, **kwargs)
+            result = run_one(task_id=selected_id, callback=tracker)
+        except ConfigurationError:
+            raise
         except Exception as exc:
             failure = exc
             logger.exception("Task %s raised an exception", selected_id)
@@ -284,7 +320,18 @@ def run_batch(
                 {**project_fields, "id": selected_id, "title": title},
                 {"status": "done", "duration_sec": duration, "log_path": log_path},
             )
-            outcomes.append(TaskOutcome(selected_id, title, True, message, log_path, duration, result.attempt_id, result.session_id))
+            outcomes.append(
+                TaskOutcome(
+                    selected_id,
+                    title,
+                    True,
+                    message,
+                    log_path,
+                    duration,
+                    result.attempt_id,
+                    result.session_id,
+                )
+            )
         else:
             if result is not None:
                 message = result.message
@@ -303,15 +350,19 @@ def run_batch(
                     "log_path": log_path,
                 },
             )
-            outcomes.append(TaskOutcome(selected_id, title, False, message, log_path, duration, result.attempt_id if result else tracker.attempt_id, result.session_id if result else None))
+            outcomes.append(
+                TaskOutcome(
+                    selected_id,
+                    title,
+                    False,
+                    message,
+                    log_path,
+                    duration,
+                    result.attempt_id if result else tracker.attempt_id,
+                    result.session_id if result else None,
+                )
+            )
 
-        if context:
-            from flowforge_storage import append_history
-            append_history(tasks_file, selected_id, {
-                "attempt_id": result.attempt_id if result else tracker.attempt_id,
-                "ok": outcomes[-1].ok, "message": message, "log_path": log_path,
-                "duration_sec": duration, "session_id": result.session_id if result else None,
-            })
         processed += 1
         if not outcomes[-1].ok and config.stop_on_failure:
             reason = "stop_on_failure"
@@ -323,9 +374,7 @@ def run_batch(
             {
                 **project_fields,
                 "reason": reason,
-                "results": [
-                    {"id": o.task_id, "title": o.title, "ok": o.ok} for o in outcomes
-                ],
+                "results": [{"id": o.task_id, "title": o.title, "ok": o.ok} for o in outcomes],
                 "completed": sum(1 for o in outcomes if o.ok),
                 "failed": sum(1 for o in outcomes if not o.ok),
                 "duration_sec": duration,
@@ -333,9 +382,7 @@ def run_batch(
         )
     elif reason == "month_gated":
         held = sum(1 for t in tasks if t.get("status", "todo") == "todo")
-        message = (
-            f"No active tasks for month f{max_month}; {held} future task(s) on hold."
-        )
+        message = f"No active tasks for month f{max_month}; {held} future task(s) on hold."
         if not quiet:
             print(message)
         logger.info("Month gate: stopping (%s)", message)

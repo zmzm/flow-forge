@@ -1,19 +1,26 @@
 """Versioned foreground CLI for manual, Hermes and scheduled operation."""
+
 from __future__ import annotations
 
 import argparse
 import json
 import logging
-import shutil
 import sys
 import uuid
 from dataclasses import asdict
 from pathlib import Path
 
 import pipeline_runner as pr
-from flowforge_config import (RuntimeContext, add_project, config_home, identifier,
-                              list_projects, resolve_context)
-from flowforge_storage import acquire_execution, busy
+from flowforge_config import (
+    RuntimeContext,
+    add_project,
+    config_home,
+    identifier,
+    list_projects,
+    resolve_context,
+)
+from flowforge_execution import Execution, preflight
+from flowforge_storage import acquire_execution
 
 SCHEMA_VERSION = 1
 
@@ -31,7 +38,9 @@ def selection(parser):
 
 
 def output_option(parser):
-    parser.add_argument("--json", action="store_true", help="Versioned JSON on stdout; diagnostics on stderr")
+    parser.add_argument(
+        "--json", action="store_true", help="Versioned JSON on stdout; diagnostics on stderr"
+    )
 
 
 def parser():
@@ -79,7 +88,13 @@ def parser():
             cmd.add_argument("source", type=Path)
             cmd.add_argument("--library", type=Path)
             cmd.add_argument("--resource", action="append", default=[], metavar="SOURCE=DEST")
-            cmd.add_argument("--path-map", action="append", default=[], metavar="OLD=NEW", help="Explicit reference substitution; supports {{workspace}} and {{artifacts_dir}}")
+            cmd.add_argument(
+                "--path-map",
+                action="append",
+                default=[],
+                metavar="OLD=NEW",
+                help="Explicit reference substitution; supports {{workspace}} and {{artifacts_dir}}",
+            )
             cmd.add_argument("--apply", action="store_true", help="Default is a read-only preview")
         else:
             selection(cmd)
@@ -101,86 +116,90 @@ def parser():
 def context_for(args, allow_legacy=False):
     if not args.project and not args.project_config and not allow_legacy:
         raise ValueError("Select --project or --project-config explicitly")
-    return resolve_context(args.project, args.project_config, {
-        "workflow_override": args.workflow, "workspace": args.workspace, "tasks_file": args.tasks_file,
-        "runs_dir": args.runs_dir, "step_timeout": args.step_timeout, "heartbeat": args.heartbeat,
-    })
-
-
-def preflight(context) -> dict:
-    from flowforge_agents import validate_agents
-    from flowforge_sync import discover, validate_queue
-    issues = []
-    if not context.workspace.is_dir():
-        issues.append(f"Workspace directory not found: {context.workspace}")
-    if not shutil.which(context.opencode):
-        issues.append(f"OpenCode executable not found: {context.opencode}")
-    try:
-        if context.tasks_dir:
-            discover(context.tasks_dir)
-        tasks = pr.read_tasks_jsonl(context.tasks_file) if context.tasks_file.exists() else []
-        if not context.tasks_dir and not context.tasks_file.is_file():
-            issues.append(f"Queue not found: {context.tasks_file}")
-        validate_queue(tasks)
-        for task in tasks:
-            path = pr.resolve_file(task["task_file"], context.workspace)
-            if not path.is_file() or task.get("source_missing"):
-                issues.append(f"{task['id']}: source missing: {path}")
-            if task.get("source_changed"):
-                issues.append(f"{task['id']}: source changed; reset explicitly")
-        for task in [None] + tasks:
-            steps = context.steps(task)
-            agents = pr.task_agents(task or {}, steps)
-            requested = pr.task_run_step_ids(task or {})
-            if requested and set(requested) - {step["id"] for step in steps}:
-                raise ValueError(f"Unknown run_steps: {requested}")
-            if not context.legacy:
-                validate_agents(context, agents.values())
-    except (OSError, ValueError) as exc:
-        issues.append(str(exc))
-    return {"ok": not issues, "issues": sorted(set(issues))}
+    return resolve_context(
+        args.project,
+        args.project_config,
+        {
+            "workflow_override": args.workflow,
+            "workspace": args.workspace,
+            "tasks_file": args.tasks_file,
+            "runs_dir": args.runs_dir,
+            "step_timeout": args.step_timeout,
+            "heartbeat": args.heartbeat,
+        },
+    )
 
 
 def execute(args, context) -> tuple[dict, int]:
     import headless_runner as hr
-    from notifications import build_notifier
     from flowforge_sync import sync
+    from notifications import build_notifier
+
     if context.legacy:
         config = hr.batch_config_from_env(context.notification_env, args.max_tasks)
     else:
-        config = hr.BatchConfig(args.max_tasks if args.max_tasks is not None else context.max_tasks,
-                                context.stop_on_failure, context.max_runtime)
+        config = hr.BatchConfig(
+            args.max_tasks if args.max_tasks is not None else context.max_tasks,
+            context.stop_on_failure,
+            context.max_runtime,
+        )
     if args.max_runtime is not None:
         config.max_runtime_seconds = args.max_runtime
     if config.max_tasks < 1 or config.max_runtime_seconds < 0:
         raise ValueError("max-tasks must be >= 1 and max-runtime >= 0")
     notifier = build_notifier(context.notification_env)
-    lock = acquire_execution(context)
-    if lock is None:
+    execution = Execution.open(context)
+    if execution is None:
         return {"reason": "busy", "busy": True, "outcomes": [], "completed": 0, "failed": 0}, 0
     try:
         if args.sync:
             sync(context)
-        report = preflight(context)
+        execution.recover()
+        report = preflight(context, args.task_id, comprehensive=False)
         if not report["ok"]:
             return {"reason": "configuration_error", **report}, 2
         run_id = uuid.uuid4().hex
-        outcome = hr.run_batch(config, notifier, task_id=args.task_id, context=context, quiet=args.json)
-        return {**asdict(outcome), "run_id": run_id, "busy": False, "completed": outcome.completed, "failed": outcome.failed}, outcome.exit_code
+        outcome = hr.run_batch(
+            config,
+            notifier,
+            task_id=args.task_id,
+            context=context,
+            quiet=args.json,
+            execution=execution,
+        )
+        return {
+            **asdict(outcome),
+            "run_id": run_id,
+            "busy": False,
+            "completed": outcome.completed,
+            "failed": outcome.failed,
+        }, outcome.exit_code
     finally:
-        lock.close()
+        execution.close()
 
 
 def dispatch(args, allow_legacy=False):
     from flowforge_agents import catalog, import_library
-    from flowforge_sync import reset_task, sync
     from flowforge_storage import atomic_json, file_transaction
+    from flowforge_sync import reset_task, sync
+
     context = None
     if args.command == "project":
         if args.action == "list":
             return {"projects": list_projects()}, 0, context
         if args.action == "add":
-            values = {key: getattr(args, key) for key in ("workspace", "tasks_dir", "tasks_file", "workflow", "workflow_file", "runs_dir", "month_gate")}
+            values = {
+                key: getattr(args, key)
+                for key in (
+                    "workspace",
+                    "tasks_dir",
+                    "tasks_file",
+                    "workflow",
+                    "workflow_file",
+                    "runs_dir",
+                    "month_gate",
+                )
+            }
             path = add_project(args.name, values)
             return {"config_file": str(path)}, 0, context
         context = resolve_context(args.name)
@@ -188,23 +207,39 @@ def dispatch(args, allow_legacy=False):
     if args.command == "workflow":
         directory = config_home() / "workflows"
         if args.action == "list":
-            return {"workflows": sorted({"default"} | {path.stem for path in directory.glob("*.json")})}, 0, None
+            return (
+                {
+                    "workflows": sorted(
+                        {"default"} | {path.stem for path in directory.glob("*.json")}
+                    )
+                },
+                0,
+                None,
+            )
         name = identifier(args.name)
         target = directory / f"{name}.json"
         if args.action == "save":
-            steps = pr.read_step_configs(args.from_file.resolve()) if args.from_file.is_file() else None
+            steps = (
+                pr.read_step_configs(args.from_file.resolve()) if args.from_file.is_file() else None
+            )
             if steps is None:
                 raise ValueError(f"Workflow input missing: {args.from_file}")
             with file_transaction(target):
                 if target.exists() and not args.replace:
-                    raise ValueError("Workflow exists; use --replace to update a shared workflow explicitly")
+                    raise ValueError(
+                        "Workflow exists; use --replace to update a shared workflow explicitly"
+                    )
                 atomic_json(target, {"steps": steps})
         else:
             if not target.exists() and name == "default":
                 target = Path(__file__).with_name("steps.json")
             if not target.exists():
                 raise ValueError(f"Unknown workflow: {name}")
-        return {"workflow": name, "path": str(target), "steps": pr.read_step_configs(target)}, 0, None
+        return (
+            {"workflow": name, "path": str(target), "steps": pr.read_step_configs(target)},
+            0,
+            None,
+        )
     if args.command == "agent" and args.action == "import":
         resources = {}
         for value in args.resource:
@@ -218,11 +253,20 @@ def dispatch(args, allow_legacy=False):
                 raise ValueError("--path-map expects non-empty OLD=NEW")
             old, new = value.split("=", 1)
             mappings[old] = new
-        result = import_library(args.source, args.library or config_home() / "library", resources, args.apply, mappings)
+        result = import_library(
+            args.source, args.library or config_home() / "library", resources, args.apply, mappings
+        )
         return result, 0 if result["ready"] else 2, None
     if args.command == "agent" and not args.project and not args.project_config:
         # Central-only inspection needs no workspace or queue.
-        context = RuntimeContext("central", Path("/nonexistent-flowforge-workspace"), Path("/nonexistent-flowforge-queue"), Path("/nonexistent-flowforge-runs"), config_home(), agents_dir=config_home() / "library")
+        context = RuntimeContext(
+            "central",
+            Path("/nonexistent-flowforge-workspace"),
+            Path("/nonexistent-flowforge-queue"),
+            Path("/nonexistent-flowforge-runs"),
+            config_home(),
+            agents_dir=config_home() / "library",
+        )
     else:
         context = context_for(args, allow_legacy)
     if args.command == "agent":
@@ -249,6 +293,7 @@ def dispatch(args, allow_legacy=False):
         return {"reset": args.task_id}, 0, context
     if args.command == "status":
         from flowforge_status import status
+
         return status(context, args.db), 0, context
     result, code = execute(args, context)
     return result, code, context
@@ -256,14 +301,25 @@ def dispatch(args, allow_legacy=False):
 
 def main(argv=None, allow_legacy=False):
     args = parser().parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
     try:
         result, code, context = dispatch(args, allow_legacy)
-        envelope = {"schema_version": SCHEMA_VERSION, "command": args.command,
-                    "project": context.project_id if context else None,
-                    "workspace": str(context.workspace) if context else None, **result}
+        envelope = {
+            "schema_version": SCHEMA_VERSION,
+            "command": args.command,
+            "project": context.project_id if context else None,
+            "workspace": str(context.workspace) if context else None,
+            **result,
+        }
     except (OSError, ValueError, RuntimeError, TypeError) as exc:
-        envelope = {"schema_version": SCHEMA_VERSION, "command": args.command, "reason": "configuration_error", "error": str(exc)}
+        envelope = {
+            "schema_version": SCHEMA_VERSION,
+            "command": args.command,
+            "reason": "configuration_error",
+            "error": str(exc),
+        }
         code = 2
         if not args.json:
             print(f"Configuration error: {exc}", file=sys.stderr)
@@ -272,6 +328,38 @@ def main(argv=None, allow_legacy=False):
     elif code != 2 or "error" not in envelope:
         print(json.dumps(envelope, ensure_ascii=False, indent=2))
     return code
+
+
+def ui_main(argv=None) -> int:
+    import argparse
+
+    from flowforge_config import resolve_context
+
+    parser = argparse.ArgumentParser(description="FlowForge task UI for one selected project")
+    selection(parser)
+    args = parser.parse_args(argv)
+    try:
+        context = resolve_context(
+            args.project,
+            args.project_config,
+            {
+                "workspace": args.workspace,
+                "tasks_file": args.tasks_file,
+                "runs_dir": args.runs_dir,
+                "workflow_override": args.workflow,
+                "step_timeout": args.step_timeout,
+                "heartbeat": args.heartbeat,
+            },
+        )
+        from flowforge_ui import TasksUI
+
+        TasksUI(context).run()
+    except (OSError, ValueError) as exc:
+        import sys
+
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

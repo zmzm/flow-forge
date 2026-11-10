@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Mapping, Optional
+from collections.abc import Mapping
 
 from .base import Notifier, NullNotifier, SafeNotifier, parse_bool
 from .matrix import MatrixNotifier
@@ -18,7 +18,7 @@ __all__ = [
 ]
 
 
-def build_notifier(env: Optional[Mapping[str, str]] = None) -> Notifier:
+def build_notifier(env: Mapping[str, str] | None = None) -> Notifier:
     env = os.environ if env is None else env
     if not parse_bool(env.get("MATRIX_ENABLED", "")):
         return NullNotifier()
@@ -29,9 +29,7 @@ def build_notifier(env: Optional[Mapping[str, str]] = None) -> Notifier:
     }
     missing = [name for name, value in settings.items() if not value]
     if missing:
-        raise ValueError(
-            "MATRIX_ENABLED is true but missing: " + ", ".join(missing)
-        )
+        raise ValueError("MATRIX_ENABLED is true but missing: " + ", ".join(missing))
     return SafeNotifier(
         MatrixNotifier(
             homeserver=settings["MATRIX_HOMESERVER"],

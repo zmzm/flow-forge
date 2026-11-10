@@ -5,6 +5,9 @@ keeps its sessions, timeout/heartbeat behavior, recovery and notifications, and 
 after a bounded batch. It has no daemon, embedded scheduler or Hermes dependency.
 Python 3.10+ and Unix `flock` are required. The headless commands use only the
 standard library. The TUI additionally uses the existing `textual`/`rich` packages.
+Install the pinned UI dependencies with `python3 -m pip install -r requirements-ui.txt`
+from the installation directory. See [development checks and module structure](development.md)
+for the separate development environment.
 
 ## Paths and configuration
 
@@ -23,7 +26,7 @@ Defaults:
 | `~/.config/flowforge/library/resources/`, `prompts/`, `skills/` | Explicitly imported resources |
 | `~/.config/flowforge/notifications.env` | Private Matrix settings; use mode 0600 |
 | `~/.local/state/flowforge/<id>/tasks.jsonl` | Directory-mode queue |
-| `~/.local/state/flowforge/<id>/artifacts/<source-hash>/` | Stable task artifacts |
+| `~/.local/state/flowforge/<id>/artifacts/<task-id>/` | Stable directory-mode task artifacts |
 | `~/.local/state/flowforge/<id>/runs/` | Unique attempt logs and OpenCode snapshots |
 
 `FLOWFORGE_CONFIG_DIR` and `FLOWFORGE_STATE_DIR` override the two roots and **must
@@ -109,10 +112,11 @@ flowforge reset --project smart-home --task-id task-HASH --json
 ```
 
 Reset requires execution locks, records prior state in history, archives the
-stable artifact directory to a `.reset-<uuid>` sibling, clears session/outputs and
-sets `todo` using the observed source hash. For JSONL projects with beside-source
-outputs, reset clears queue metadata but leaves old files for manual review;
-explicitly remove/archive obsolete files before relying on failed-task resume.
+stable artifact directory to a `.reset-<uuid>` sibling, clears session, outputs,
+checkpoints and stage metadata, and sets `todo` using the observed source hash.
+For JSONL projects with beside-source
+outputs, reset clears queue metadata but leaves old files for manual review.
+Those files cannot satisfy a resume checkpoint after reset.
 
 `sync --dry-run` creates no directories, queues, lock files or artifacts. Doctor
 and status are also read-only and never execute agents. `run --sync` synchronizes
@@ -210,11 +214,33 @@ protocol rather than directly replacing an old full-queue snapshot.
 
 Automatic runs pick only `todo`; failed tasks require explicit selection. New
 projects are ungated by default; `month_gate: true` restores legacy month behavior.
-Each step has its own session; only the first resumed step reuses the saved one.
+Each step has its own session; only the first resumed step may reuse the saved one,
+when its recorded step and revision still match.
 Unique timestamp/UUID attempt logs retain the `_<task-id>.log` suffix; queues expose
-attempt_id, current session and log path during execution. Batches append attempt
-summaries to history. A successful step requires exit 0, no OpenCode error event,
-and its expected output. Stop/timeout/error/exception still fail the task.
+attempt_id, current session and log path during execution. A shared execution lease
+owns locks, recovery and attempt history for both CLI and TUI runs. A successful
+step requires exit 0, no OpenCode error event, and its expected output.
+Stop/timeout/error/exception still fail the task. Logs are written as lines arrive;
+only session/error summaries stay in memory. Subprocesses run in a separate process
+group, receive SIGTERM on stop/timeout, and escalate to SIGKILL after ten seconds.
+Every exit path reaps the direct child and terminates remaining members of its group
+before returning execution ownership. Quitting the TUI waits for this finalization.
+
+Each successful step immediately persists a checkpoint with a chained source and
+workflow fingerprint, effective selected agent definition in project mode, input
+hash and output hash. Resume skips only verified checkpoints, starting at the first
+invalid or missing one. A partial output from a failed step is never a checkpoint.
+Explicit reruns invalidate checkpoints from their earliest selected step onward.
+Older failed queues without checkpoints rerun all unverified steps; existing files
+are retained. A saved session is reused only for the first resumed step and is
+discarded when its recorded step or revision differs. Checkpoints do not track
+arbitrary changes to the workspace or external resources used by an agent.
+
+Doctor inspects all task sources and workflows. Execution validates shared queue
+structure and the selected task; an unrelated completed or missing task does not
+block an explicit healthy selection. Batches validate tasks as selected and stop
+with a configuration error on invalid task configuration, retaining earlier results
+and history. They do not silently skip invalid pending tasks.
 
 Project status uses the recorded session, checks the workspace when the SQLite
 schema exposes it, and only falls back to titles containing a hash of the canonical
