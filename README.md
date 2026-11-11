@@ -39,7 +39,7 @@ Requirements:
 - Python 3.10+ on Linux or another Unix-like system with `flock` support.
 - `opencode` installed, authenticated, and available in `PATH` (or configured with `OPENCODE_BIN`).
 - OpenCode agents matching your pipeline configuration, available in the target project's `.opencode/agents/` or `~/.config/opencode/agents/`.
-- For the TUI only: `pip install textual rich`. The headless runner and status watcher use the Python standard library.
+- For the TUI only: `python3 -m pip install -r requirements-ui.txt`. The headless runner and status watcher use the Python standard library.
 
 Run commands from this repository's root. Set the two required paths in your shell or in a `.env` file in the working directory:
 
@@ -55,6 +55,11 @@ Create a Markdown task description and a queue file containing one JSON object p
 ```json
 {"id":"task-1","task_file":"/absolute/path/to/task.md","status":"todo"}
 ```
+
+Additional sample rows live in [fake-tasks.jsonl](fake-tasks.jsonl), retained as a
+queue-format example with illustrative paths and session IDs. Its legacy `steps`
+and `step_labels` fields are obsolete; current step configuration uses workflows
+and the optional task `run_steps` selection.
 
 Configure the agents in `steps.json` as described below, then choose an interface:
 
@@ -101,7 +106,7 @@ Tasks can override agents or select particular steps:
 {"id":"task-1","task_file":"/absolute/path/to/task.md","status":"failed","run_steps":["execution"],"agents":{"execution":"custom-execution"}}
 ```
 
-`run_steps` runs only the listed step ids, in the listed order. Each selected step still needs its normal input file. Without `run_steps`, non-failed tasks run the full pipeline; failed tasks resume from the first step whose output file is missing. Explicit step selection takes precedence over automatic resume.
+`run_steps` runs only the listed step ids, in the listed order. Each selected step still needs its normal input file. Without `run_steps`, non-failed tasks run the full pipeline; failed tasks resume from the first step without a valid successful checkpoint. Checkpoints verify source/workflow revisions and input/output hashes. Older failed tasks without checkpoints rerun their unverified steps even when output files exist. Explicit step selection takes precedence over automatic resume.
 
 The TUI editor lets you edit agents, task workflow and `run_steps`. Any compatible catalog agent can be selected without editing step favorites. In registered-project mode the workflow editor saves a project-specific copy; in legacy mode it edits steps.json.
 
@@ -109,11 +114,11 @@ The TUI editor lets you edit agents, task workflow and `run_steps`. Any compatib
 
 Automatic queue selection picks only `todo` tasks, up to the batch limit (one by default). Failed tasks require explicit selection with `--task-id` or through the TUI.
 
-Task ids matching `f<N>-d<M>` also act as a month gate for automatic headless selection: `f9` means September 2026, `f13` means January 2027, and so on. Future-month tasks wait until their month arrives; other ids stay eligible. If only future tasks remain, the batch exits successfully with reason `month_gated`. An explicit `--task-id` and TUI selection bypass this gate.
+Legacy automatic headless selection applies a month gate to task ids matching `f<N>-d<M>`: `f9` means September 2026, `f13` means January 2027, and so on. Future-month tasks wait until their month arrives; other ids stay eligible. Registered projects are ungated by default; set `month_gate: true` to enable this policy. If only future tasks remain in a gated queue, the batch exits successfully with reason `month_gated`. An explicit `--task-id` and TUI selection bypass the gate.
 
-A task becomes `running` when execution starts, then `done` on success or `failed` on an error, stop, or timeout. Success requires an exit code of zero, no error event from OpenCode, and the expected output file. FlowForge persists `session_id`, `last_run_log`, and successful step `outputs` back to the queue.
+A task becomes `running` when execution starts, then `done` on success or `failed` on an error, stop, or timeout. Success requires an exit code of zero, no error event from OpenCode, and the expected output file. FlowForge persists `session_id` as events arrive, and records successful step `outputs` and `checkpoints` immediately. CLI and TUI attempts both retain history. Logs are appended as output arrives; stop, timeout, and observer exceptions terminate and reap the subprocess before releasing execution locks. Quitting the TUI during a run stops and finalizes the attempt before exiting.
 
-If a runner dies mid-task, the next headless run marks stale `running` tasks as `failed`. Select the failed task explicitly to resume it. Its recorded OpenCode session is reused for the first re-executed step; later steps start separate sessions.
+If a runner dies mid-task, the next execution lease marks stale `running` tasks as `failed` while holding the execution locks. Select the failed task explicitly to resume it. Its recorded OpenCode session is reused for the first re-executed step unless the recorded step or revision differs; later steps start separate sessions. File existence alone never proves that a failed step completed successfully.
 
 ```bash
 # Resume a timed-out task with a two-hour timeout per step
@@ -157,7 +162,7 @@ python3 watch-task.py --json          # one machine-readable status report
 
 The text report combines queue state and logs with active OpenCode sessions, including subagents, from `~/.local/share/opencode/opencode.db`. Use `--db` to point to another database. It falls back to task-id session titles when a recorded session is stale.
 
-JSON output uses schema version 1 and includes lock state, the running task and stage, task rows, queue total, and failure details (including quota reset time when found in the log). It is consumed by the separate `matrix-flowforge-bot` integration.
+Legacy `watch-task.py --json` output uses schema version 1 and includes lock state, the running task and stage, task rows, queue total, and failure details (including quota reset time when found in the log). It is consumed by the separate `matrix-flowforge-bot` integration. With `--project NAME`, the watcher uses the separate [project CLI envelope](docs/hermes.md) and correlates sessions using the canonical workspace and queue.
 
 ## Terminal UI
 
@@ -169,32 +174,44 @@ The TUI provides a task table with status filters, task details, a live run head
 |---|---|
 | `r` | Run selected task |
 | `s` | Stop active run |
-| `e` | Edit task agents and run steps |
-| `g` | Edit global `steps.json` |
-| `f` | Cycle filter (`all/todo/failed/done`) |
+| `e` | Edit task workflow, agents and run steps |
+| `g` | Edit the project workflow copy, or `steps.json` in legacy mode |
+| `f` | Cycle filter (`all/todo/running/failed/done`) |
 | `u` | Refresh table |
 | `c` | Clear events feed |
-| `q` | Quit |
+| `q` | Stop and finalize an active run, then quit |
 
 ## Project Layout
 
 | Path | Responsibility |
 |---|---|
-| `pipeline_runner.py` | Shared execution engine, step configuration, queue persistence, sessions, and event streaming |
+| `pipeline_runner.py` | Step planning, checkpoint validation, task lifecycle and runner events |
+| `flowforge_execution.py` | CLI/TUI execution leases, scoped preflight, recovery and attempt history |
+| `flowforge_storage.py` | Queue serialization, atomic persistence, transactions and execution locks |
+| `flowforge_workflows.py` | Workflow parsing, normalization, persistence and agent selection |
+| `flowforge_opencode.py` | Subprocess cleanup, cancellation, incremental logs and event parsing |
+| `flowforge_inspection.py` | Shared read-only OpenCode database and log inspection |
+| `flowforge_models.py` | Shared workflow types and named execution results |
 | `run-task.py` | Headless CLI, timeout override, locking, and exit codes |
 | `headless_runner.py` | Batch selection, limits, stale-task recovery, lifecycle logging, and notifications |
-| `tasks-ui.py` | Textual interface and task/pipeline editors |
-| `watch-task.py` | Read-only task and OpenCode session monitoring |
+| `flowforge_ui.py` / `tasks-ui.py` | Importable Textual interface and compatibility launcher |
+| `flowforge_watch.py` / `watch-task.py` | Importable status watcher and compatibility launcher |
 | `notifications/` | Notifier interface and Matrix HTTP implementation |
 | `deploy/` | Example systemd service and timer |
 | `docs/headless-server.md` | Server deployment and notification setup |
 | `tests/` | Standard-library unit tests with isolated queues and mocked Matrix HTTP |
+| `tests/support/` | Shared project, filesystem, notification and SQLite fixtures |
+| `pyproject.toml` / `scripts/check.py` | Python quality configuration and common check command |
 
 ## Development Checks
 
 ```bash
-python3 -m py_compile tasks-ui.py pipeline_runner.py run-task.py headless_runner.py watch-task.py
-python3 -m unittest discover -s tests
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python scripts/check.py
 ```
 
+This runs Ruff, formatting verification, mypy, compilation and all tests, including
+the UI. For a headless environment use `python3 scripts/check.py --stdlib-only`.
 Tests set their own `PROJECT_DIR` and `TASKS_FILE` and do not contact the network.
+See [the Python development guide](docs/development.md) for structure and conventions.

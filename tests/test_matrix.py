@@ -5,10 +5,9 @@ import unittest
 import urllib.error
 from unittest import mock
 
-try:
-    import _bootstrap  # noqa: F401
-except ImportError:
-    from tests import _bootstrap  # noqa: F401
+from tests import _bootstrap as _bootstrap
+
+# isort: split
 
 from notifications import MatrixNotifier, NullNotifier, SafeNotifier, build_notifier
 from notifications.matrix import format_duration
@@ -46,18 +45,22 @@ class BuildNotifierTests(unittest.TestCase):
 
     def test_enabled_partial_settings_raise(self):
         with self.assertRaises(ValueError):
-            build_notifier(env={
-                "MATRIX_ENABLED": "true",
-                "MATRIX_HOMESERVER": "https://matrix.example.com",
-            })
+            build_notifier(
+                env={
+                    "MATRIX_ENABLED": "true",
+                    "MATRIX_HOMESERVER": "https://matrix.example.com",
+                }
+            )
 
     def test_enabled_returns_safe_matrix_notifier(self):
-        notifier = build_notifier(env={
-            "MATRIX_ENABLED": "true",
-            "MATRIX_HOMESERVER": "https://matrix.example.com",
-            "MATRIX_ROOM_ID": "!room:example.com",
-            "MATRIX_ACCESS_TOKEN": "token",
-        })
+        notifier = build_notifier(
+            env={
+                "MATRIX_ENABLED": "true",
+                "MATRIX_HOMESERVER": "https://matrix.example.com",
+                "MATRIX_ROOM_ID": "!room:example.com",
+                "MATRIX_ACCESS_TOKEN": "token",
+            }
+        )
         self.assertIsInstance(notifier, SafeNotifier)
         self.assertIsInstance(notifier.inner, MatrixNotifier)
 
@@ -72,11 +75,13 @@ class MatrixMessageTests(unittest.TestCase):
         return self.transport.bodies[0]
 
     def test_task_started_message(self):
-        self.notifier.task_started({
-            "id": "f2-d8",
-            "title": "Implement refresh token rotation",
-            "started_at": "2026-09-17 03:02",
-        })
+        self.notifier.task_started(
+            {
+                "id": "f2-d8",
+                "title": "Implement refresh token rotation",
+                "started_at": "2026-09-17 03:02",
+            }
+        )
         body = self.sent()
         self.assertIn("FlowForge task started", body)
         self.assertIn("f2-d8 — Implement refresh token rotation", body)
@@ -122,16 +127,18 @@ class MatrixMessageTests(unittest.TestCase):
         self.assertLess(len(body), 1000)
 
     def test_run_completed_message(self):
-        self.notifier.run_completed({
-            "results": [
-                {"id": "f2-d8", "title": "Implement refresh token rotation", "ok": True},
-                {"id": "f2-d9", "title": "Add validation", "ok": True},
-                {"id": "f2-d10", "title": "Add integration tests", "ok": False},
-            ],
-            "completed": 2,
-            "failed": 1,
-            "duration_sec": 8220,
-        })
+        self.notifier.run_completed(
+            {
+                "results": [
+                    {"id": "f2-d8", "title": "Implement refresh token rotation", "ok": True},
+                    {"id": "f2-d9", "title": "Add validation", "ok": True},
+                    {"id": "f2-d10", "title": "Add integration tests", "ok": False},
+                ],
+                "completed": 2,
+                "failed": 1,
+                "duration_sec": 8220,
+            }
+        )
         body = self.sent()
         self.assertIn("FlowForge run finished", body)
         self.assertIn("✅ f2-d8 — Implement refresh token rotation", body)
@@ -142,14 +149,16 @@ class MatrixMessageTests(unittest.TestCase):
         self.assertIn("Duration: 2h 17m", body)
 
     def test_run_completed_message_with_idle_month_reason(self):
-        self.notifier.run_completed({
-            "results": [],
-            "completed": 0,
-            "failed": 0,
-            "duration_sec": 0.5,
-            "reason": "month_gated",
-            "message": "No active tasks for month f9; 2 future task(s) on hold.",
-        })
+        self.notifier.run_completed(
+            {
+                "results": [],
+                "completed": 0,
+                "failed": 0,
+                "duration_sec": 0.5,
+                "reason": "month_gated",
+                "message": "No active tasks for month f9; 2 future task(s) on hold.",
+            }
+        )
         body = self.sent()
         self.assertIn("FlowForge run finished", body)
         self.assertIn("No active tasks for month f9", body)
@@ -165,9 +174,11 @@ class MatrixHttpTests(unittest.TestCase):
         urlopen.assert_called_once()
         (request,), kwargs = urlopen.call_args
         self.assertEqual(request.get_method(), "PUT")
-        self.assertTrue(request.full_url.startswith(
-            "https://matrix.example.com/_matrix/client/v3/rooms/%21room%3Aexample.com/send/m.room.message/m"
-        ))
+        self.assertTrue(
+            request.full_url.startswith(
+                "https://matrix.example.com/_matrix/client/v3/rooms/%21room%3Aexample.com/send/m.room.message/m"
+            )
+        )
         self.assertEqual(request.headers.get("Authorization"), "Bearer secret-token")
         self.assertEqual(request.headers.get("User-agent"), "FlowForge/1.0")
         payload = json.loads(request.data.decode("utf-8"))
@@ -189,15 +200,16 @@ class MatrixHttpTests(unittest.TestCase):
         with mock.patch("urllib.request.urlopen") as urlopen:
             urlopen.side_effect = urllib.error.URLError("connection refused")
             with self.assertLogs("flowforge.notifications", level="ERROR"):
-                notifier.run_completed({"results": [{"id": "x", "ok": True}], "completed": 1, "failed": 0})
+                notifier.run_completed(
+                    {"results": [{"id": "x", "ok": True}], "completed": 1, "failed": 0}
+                )
         self.assertTrue(urlopen.called)
 
     def test_timeout_error_does_not_raise_through_safe_notifier(self):
-        import socket
 
         notifier = SafeNotifier(make_notifier())
         with mock.patch("urllib.request.urlopen") as urlopen:
-            urlopen.side_effect = socket.timeout("timed out")
+            urlopen.side_effect = TimeoutError("timed out")
             with self.assertLogs("flowforge.notifications", level="ERROR"):
                 notifier.task_failed({"id": "x"}, {"message": "boom"})
         self.assertTrue(urlopen.called)

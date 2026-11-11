@@ -2,18 +2,16 @@
 
 import json
 import os
-import tempfile
 import unittest
 from datetime import datetime
-from pathlib import Path
 from unittest import mock
 
-try:
-    import _bootstrap  # noqa: F401
-except ImportError:
-    from tests import _bootstrap  # noqa: F401
+from tests import _bootstrap as _bootstrap
+
+# isort: split
 
 import pipeline_runner as pr
+from tests.support.filesystem import temporary_directory
 
 FAKE_OK = r"""#!/usr/bin/env python3
 import json
@@ -64,7 +62,9 @@ print(json.dumps({"type": "event", "sessionID": "ses-%d" % len(calls)}))
 class ParseTests(unittest.TestCase):
     def test_parse_session_id_variants(self):
         self.assertEqual(pr.parse_session_id_from_json_events('{"sessionID": "s1"}'), "s1")
-        self.assertEqual(pr.parse_session_id_from_json_events('{"part": {"sessionId": "s2"}}'), "s2")
+        self.assertEqual(
+            pr.parse_session_id_from_json_events('{"part": {"sessionId": "s2"}}'), "s2"
+        )
         self.assertEqual(pr.parse_session_id_from_json_events('{"metadata": {"id": "s3"}}'), "s3")
         self.assertIsNone(pr.parse_session_id_from_json_events('{"type": "text"}\nnot json'))
 
@@ -79,28 +79,6 @@ class ParseTests(unittest.TestCase):
             pr.parse_opencode_error_from_json_events('{"type":"error","error":"boom"}'),
             "boom",
         )
-
-
-class OptionalIntEnvTests(unittest.TestCase):
-    def test_default_when_unset(self):
-        with mock.patch.dict(os.environ):
-            os.environ.pop("FLOWFORGE_TEST_INT", None)
-            self.assertEqual(pr._optional_int_env("FLOWFORGE_TEST_INT", 5), 5)
-
-    def test_zero_and_negative_disable(self):
-        with mock.patch.dict(os.environ, {"FLOWFORGE_TEST_INT": "0"}):
-            self.assertIsNone(pr._optional_int_env("FLOWFORGE_TEST_INT", 5))
-        with mock.patch.dict(os.environ, {"FLOWFORGE_TEST_INT": "-3"}):
-            self.assertIsNone(pr._optional_int_env("FLOWFORGE_TEST_INT", 5))
-
-    def test_value(self):
-        with mock.patch.dict(os.environ, {"FLOWFORGE_TEST_INT": "120"}):
-            self.assertEqual(pr._optional_int_env("FLOWFORGE_TEST_INT", 5), 120)
-
-    def test_invalid_raises(self):
-        with mock.patch.dict(os.environ, {"FLOWFORGE_TEST_INT": "abc"}):
-            with self.assertRaises(RuntimeError):
-                pr._optional_int_env("FLOWFORGE_TEST_INT", 5)
 
 
 class MonthNumberTests(unittest.TestCase):
@@ -146,7 +124,7 @@ class FindNextTodoTests(unittest.TestCase):
 
 class StepSelectionTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="flowforge-steps-"))
+        self.tmp = temporary_directory(self, "flowforge-steps-")
         self.out_dir = self.tmp / "outputs"
         self.out_dir.mkdir()
 
@@ -179,28 +157,26 @@ class StepSelectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pr.select_steps_for_task({"run_steps": ["nope"]}, self.steps_fixture())
 
-    def test_failed_resumes_from_missing_output(self):
+    def test_failed_does_not_trust_unverified_output(self):
         self.touch_outputs("concept")
         steps, mode = pr.select_steps_for_task({"status": "failed"}, self.steps_fixture())
-        self.assertEqual([s["id"] for s in steps], ["grounded", "execution"])
+        self.assertEqual([s["id"] for s in steps], ["concept", "grounded", "execution"])
         self.assertEqual(mode, "resume")
 
-    def test_failed_all_outputs_already_complete(self):
+    def test_failed_all_outputs_still_require_checkpoints(self):
         self.touch_outputs("concept", "grounded", "execution")
         steps, mode = pr.select_steps_for_task({"status": "failed"}, self.steps_fixture())
-        self.assertEqual(steps, [])
-        self.assertEqual(mode, "already_complete")
+        self.assertEqual([s["id"] for s in steps], ["concept", "grounded", "execution"])
+        self.assertEqual(mode, "resume")
 
 
 class PersistenceTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="flowforge-persist-"))
+        self.tmp = temporary_directory(self, "flowforge-persist-")
         self.tasks_file = self.tmp / "tasks.jsonl"
 
     def write_rows(self, rows):
-        self.tasks_file.write_text(
-            "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
-        )
+        self.tasks_file.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
 
     def rows(self):
         return pr.read_tasks_jsonl(self.tasks_file)
@@ -214,7 +190,7 @@ class PersistenceTests(unittest.TestCase):
     def test_persist_update_merges_by_id_after_reorder(self):
         self.write_rows([{"id": "a", "status": "todo"}, {"id": "b", "status": "todo"}])
         self.write_rows([{"id": "b", "status": "todo"}, {"id": "a", "status": "todo"}])
-        pr._persist_task_update(self.tasks_file, 0, "a", {"status": "done"})
+        pr._persist_task_update(self.tasks_file, "a", {"status": "done"})
         rows = self.rows()
         self.assertEqual([r["id"] for r in rows], ["b", "a"])
         self.assertEqual(rows[1]["status"], "done")
@@ -222,17 +198,19 @@ class PersistenceTests(unittest.TestCase):
 
     def test_persist_update_appends_missing_task(self):
         self.write_rows([{"id": "a", "status": "todo"}])
-        pr._persist_task_update(self.tasks_file, 9, "zz", {"status": "done"})
+        pr._persist_task_update(self.tasks_file, "zz", {"status": "done"})
         rows = self.rows()
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[1], {"id": "zz", "status": "done"})
 
     def test_recover_stale_running_tasks(self):
-        self.write_rows([
-            {"id": "x", "status": "running", "task_file": "/tmp/x.md"},
-            {"id": "y", "status": "todo", "task_file": "/tmp/y.md"},
-            {"id": "z", "status": "done", "task_file": "/tmp/z.md"},
-        ])
+        self.write_rows(
+            [
+                {"id": "x", "status": "running", "task_file": "/tmp/x.md"},
+                {"id": "y", "status": "todo", "task_file": "/tmp/y.md"},
+                {"id": "z", "status": "done", "task_file": "/tmp/z.md"},
+            ]
+        )
         recovered = pr.recover_stale_running_tasks(self.tasks_file)
         self.assertEqual(recovered, ["x"])
         rows = {r["id"]: r["status"] for r in self.rows()}
@@ -248,7 +226,7 @@ class PersistenceTests(unittest.TestCase):
 
 class PipelineIntegrationTestCase(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="flowforge-int-"))
+        self.tmp = temporary_directory(self, "flowforge-int-")
         self.project = self.tmp / "project"
         self.project.mkdir()
         self._orig = {
@@ -311,8 +289,10 @@ class RunSelectedTaskTests(PipelineIntegrationTestCase):
         self.add_task()
         bin_path = self.make_opencode("fake-hang", FAKE_HANG)
         events = []
-        with mock.patch.dict(os.environ, {"OPENCODE_BIN": str(bin_path)}), \
-                mock.patch.object(pr, "STEP_TIMEOUT_SEC", 1):
+        with (
+            mock.patch.dict(os.environ, {"OPENCODE_BIN": str(bin_path)}),
+            mock.patch.object(pr, "STEP_TIMEOUT_SEC", 1),
+        ):
             result = pr.run_selected_task(task_id="t1", callback=events.append)
         self.assertFalse(result.ok)
         self.assertEqual(self.task_row()["status"], "failed")
@@ -327,19 +307,30 @@ class RunSelectedTaskTests(PipelineIntegrationTestCase):
         self.assertEqual(self.task_row()["status"], "failed")
 
     def test_already_complete_failed_task_marks_done(self):
-        for name in ("concept-plan.md", "grounded-plan.md", "execution.md"):
-            (self.project / name).write_text("x", encoding="utf-8")
-        self.add_task(status="failed")
-        result = pr.run_selected_task(task_id="t1")
+        self.add_task()
+        binary = self.make_opencode("fake-complete", FAKE_OK)
+        with mock.patch.dict(os.environ, {"OPENCODE_BIN": str(binary)}):
+            self.assertTrue(pr.run_selected_task("t1").ok)
+        pr._persist_task_update(pr.TASKS_FILE, "t1", {"status": "failed"})
+        with mock.patch.object(
+            pr, "run_opencode_step_stream", side_effect=AssertionError("unexpected execution")
+        ):
+            result = pr.run_selected_task(task_id="t1")
         self.assertTrue(result.ok)
         self.assertEqual(self.task_row()["status"], "done")
 
     def test_failed_task_resumes_from_missing_output(self):
-        (self.project / "concept-plan.md").write_text("x", encoding="utf-8")
-        self.add_task(status="failed")
+        self.add_task()
         bin_path = self.make_opencode("fake-ok2", FAKE_OK)
         events = []
         with mock.patch.dict(os.environ, {"OPENCODE_BIN": str(bin_path)}):
+
+            def interrupt(event):
+                if event["kind"] == "step_start" and event["index"] == 1:
+                    raise RuntimeError("interrupted")
+
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                pr.run_selected_task("t1", callback=interrupt)
             result = pr.run_selected_task(task_id="t1", callback=events.append)
         self.assertTrue(result.ok)
         starts = [e.get("label") for e in events if e.get("kind") == "step_start"]
@@ -364,14 +355,18 @@ class RunSelectedTaskTests(PipelineIntegrationTestCase):
         self.assertEqual(self.task_row()["session_id"], "ses-3")
 
     def test_failed_resume_continues_recorded_session_for_first_step_only(self):
-        (self.project / "concept-plan.md").write_text("x", encoding="utf-8")
-        (self.project / "task.md").write_text("# Sample task\n", encoding="utf-8")
-        pr.write_tasks_jsonl(
-            pr.TASKS_FILE,
-            [{"id": "t1", "task_file": "task.md", "status": "failed", "session_id": "ses-old"}],
-        )
+        self.add_task()
         bin_path = self.make_opencode("fake-resume", FAKE_ARGS)
         with mock.patch.dict(os.environ, {"OPENCODE_BIN": str(bin_path)}):
+
+            def interrupt(event):
+                if event["kind"] == "step_start" and event["index"] == 1:
+                    raise RuntimeError("interrupted")
+
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                pr.run_selected_task("t1", callback=interrupt)
+            pr._persist_task_update(pr.TASKS_FILE, "t1", {"session_id": "ses-old"})
+            (self.tmp / "fake-resume.args").unlink()
             result = pr.run_selected_task(task_id="t1")
         self.assertTrue(result.ok)
         calls = self.captured_calls("fake-resume")
@@ -396,9 +391,11 @@ class HeartbeatTests(PipelineIntegrationTestCase):
         events = []
         log_path = pr.RUNS_DIR / "heartbeat.log"
         pr.RUNS_DIR.mkdir(parents=True, exist_ok=True)
-        with mock.patch.dict(os.environ, {"OPENCODE_BIN": str(bin_path)}), \
-                mock.patch.object(pr, "STEP_TIMEOUT_SEC", 4), \
-                mock.patch.object(pr, "HEARTBEAT_SEC", 1):
+        with (
+            mock.patch.dict(os.environ, {"OPENCODE_BIN": str(bin_path)}),
+            mock.patch.object(pr, "STEP_TIMEOUT_SEC", 4),
+            mock.patch.object(pr, "HEARTBEAT_SEC", 1),
+        ):
             rc, _out, sid, timed_out = pr.run_opencode_step_stream(
                 agent="execution-plan",
                 model=None,
@@ -410,7 +407,9 @@ class HeartbeatTests(PipelineIntegrationTestCase):
             )
         self.assertNotEqual(rc, 0)
         self.assertTrue(timed_out)
-        beats = [e for e in events if e.get("kind") == "line" and "[heartbeat]" in e.get("text", "")]
+        beats = [
+            e for e in events if e.get("kind") == "line" and "[heartbeat]" in e.get("text", "")
+        ]
         self.assertTrue(beats)
         log_text = log_path.read_text(encoding="utf-8")
         self.assertIn("[heartbeat]", log_text)
@@ -429,8 +428,10 @@ for _ in range(6):
         events = []
         log_path = pr.RUNS_DIR / "chatty.log"
         pr.RUNS_DIR.mkdir(parents=True, exist_ok=True)
-        with mock.patch.dict(os.environ, {"OPENCODE_BIN": str(bin_path)}), \
-                mock.patch.object(pr, "HEARTBEAT_SEC", 1):
+        with (
+            mock.patch.dict(os.environ, {"OPENCODE_BIN": str(bin_path)}),
+            mock.patch.object(pr, "HEARTBEAT_SEC", 1),
+        ):
             rc, _out, _sid, timed_out = pr.run_opencode_step_stream(
                 agent="execution-plan",
                 model=None,
@@ -442,7 +443,9 @@ for _ in range(6):
             )
         self.assertEqual(rc, 0)
         self.assertFalse(timed_out)
-        beats = [e for e in events if e.get("kind") == "line" and "[heartbeat]" in e.get("text", "")]
+        beats = [
+            e for e in events if e.get("kind") == "line" and "[heartbeat]" in e.get("text", "")
+        ]
         self.assertEqual(beats, [])
 
 

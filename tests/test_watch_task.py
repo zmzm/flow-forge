@@ -2,86 +2,71 @@
 
 import contextlib
 import fcntl
-import importlib.util
 import io
 import json
-import sqlite3
-import tempfile
 import time
 import unittest
 from datetime import datetime
-from pathlib import Path
 
-try:
-    import _bootstrap  # noqa: F401
-except ImportError:
-    from tests import _bootstrap  # noqa: F401
+from tests import _bootstrap as _bootstrap
 
-_spec = importlib.util.spec_from_file_location(
-    "watch_task", Path(__file__).resolve().parent.parent / "watch-task.py"
-)
-wt = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(wt)
+# isort: split
 
-
-def _make_db(path: Path) -> sqlite3.Connection:
-    db = sqlite3.connect(path)
-    db.execute(
-        "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, title TEXT,"
-        " agent TEXT, model TEXT, time_created INTEGER, time_updated INTEGER, time_archived INTEGER)"
-    )
-    db.execute(
-        "CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER,"
-        " time_updated INTEGER, data TEXT)"
-    )
-    return db
-
-
-def _add_session(db, sid, parent_id=None, agent="execution-plan", model=None,
-                 created=1000000, updated=1000000, title="t1: task.md"):
-    db.execute(
-        "INSERT INTO session (id, parent_id, title, agent, model, time_created, time_updated, time_archived)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
-        (sid, parent_id, title, agent, model, created, updated),
-    )
-
-
-def _add_part(db, sid, ts, payload):
-    db.execute(
-        "INSERT INTO part (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
-        (f"{sid}-{ts}", sid, ts, ts, json.dumps(payload)),
-    )
+import flowforge_watch as wt
+from flowforge_inspection import model_label
+from tests.support.filesystem import temporary_directory
+from tests.support.opencode_db import add_part, add_session, make_db
 
 
 class ModelLabelTests(unittest.TestCase):
     def test_json_model_label(self):
         raw = json.dumps({"providerID": "zai-coding-plan", "id": "glm-5.3"})
-        self.assertEqual(wt._model_label(raw), "zai-coding-plan/glm-5.3")
+        self.assertEqual(model_label(raw), "zai-coding-plan/glm-5.3")
 
     def test_missing_and_plain(self):
-        self.assertEqual(wt._model_label(None), "-")
-        self.assertEqual(wt._model_label("glm-4.6"), "glm-4.6")
+        self.assertEqual(model_label(None), "-")
+        self.assertEqual(model_label("glm-4.6"), "glm-4.6")
 
 
 class RenderReportTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="flowforge-watch-"))
+        self.tmp = temporary_directory(self, "flowforge-watch-")
         self.db_path = self.tmp / "opencode.db"
-        self.db = _make_db(self.db_path)
+        self.db = make_db(self.db_path)
+        self.addCleanup(self.db.close)
         now = int(time.time() * 1000)
         self.now = now
-        _add_session(
-            self.db, "ses-parent0001", agent="execution-plan",
+        add_session(
+            self.db,
+            "ses-parent0001",
+            agent="execution-plan",
             model=json.dumps({"providerID": "zai-coding-plan", "id": "glm-5.3"}),
-            created=now - 600_000, updated=now - 2_000, title="t1: task.md",
+            created=now - 600_000,
+            updated=now - 2_000,
+            title="t1: task.md",
         )
-        _add_session(
-            self.db, "ses-child00001", parent_id="ses-parent0001", agent="general",
+        add_session(
+            self.db,
+            "ses-child00001",
+            parent_id="ses-parent0001",
+            agent="general",
             model=json.dumps({"providerID": "zai-coding-plan", "id": "glm-4.7"}),
-            created=now - 300_000, updated=now - 1_000, title="",
+            created=now - 300_000,
+            updated=now - 1_000,
+            title="",
         )
-        _add_part(self.db, "ses-parent0001", now - 5_000, {"type": "tool", "tool": "read", "state": {"status": "completed"}})
-        _add_part(self.db, "ses-child00001", now - 1_000, {"type": "text", "text": "Chunk B in progress\nsecond line"})
+        add_part(
+            self.db,
+            "ses-parent0001",
+            now - 5_000,
+            {"type": "tool", "tool": "read", "state": {"status": "completed"}},
+        )
+        add_part(
+            self.db,
+            "ses-child00001",
+            now - 1_000,
+            {"type": "text", "text": "Chunk B in progress\nsecond line"},
+        )
         self.db.commit()
         self.tasks = [
             {
@@ -104,14 +89,26 @@ class RenderReportTests(unittest.TestCase):
         self.assertIn("Chunk B in progress", report)
 
     def test_unrelated_active_session_listed_separately(self):
-        _add_session(self.db, "ses-other0001", agent="build", created=self.now - 60_000, updated=self.now - 3_000)
+        add_session(
+            self.db,
+            "ses-other0001",
+            agent="build",
+            created=self.now - 60_000,
+            updated=self.now - 3_000,
+        )
         self.db.commit()
         report = wt.render_report(tasks=self.tasks, db=self.db, window_minutes=15, parts=1)
         self.assertIn("Other active sessions", report)
         self.assertIn("ses-other0001", report)
 
     def test_stale_session_outside_window_hidden(self):
-        _add_session(self.db, "ses-stale0001", agent="build", created=self.now - 3_600_000, updated=self.now - 3_600_000)
+        add_session(
+            self.db,
+            "ses-stale0001",
+            agent="build",
+            created=self.now - 3_600_000,
+            updated=self.now - 3_600_000,
+        )
         self.db.commit()
         report = wt.render_report(tasks=self.tasks, db=self.db, window_minutes=15, parts=1)
         self.assertNotIn("ses-stale0001", report)
@@ -128,9 +125,13 @@ class RenderReportTests(unittest.TestCase):
             "UPDATE session SET time_updated = ? WHERE id IN ('ses-parent0001', 'ses-child00001')",
             (self.now - 3_600_000,),
         )
-        _add_session(
-            self.db, "ses-active0001", agent="execution-plan",
-            created=self.now - 60_000, updated=self.now - 1_000, title="t1: task.md",
+        add_session(
+            self.db,
+            "ses-active0001",
+            agent="execution-plan",
+            created=self.now - 60_000,
+            updated=self.now - 1_000,
+            title="t1: task.md",
         )
         self.db.commit()
         report = wt.render_report(tasks=self.tasks, db=self.db, window_minutes=15, parts=1)
@@ -148,14 +149,16 @@ class RenderReportTests(unittest.TestCase):
         self.assertIn("active sessions unavailable", report)
 
     def test_no_running_tasks(self):
-        report = wt.render_report(tasks=[{"id": "t9", "status": "todo"}], db=self.db, window_minutes=15, parts=1)
+        report = wt.render_report(
+            tasks=[{"id": "t9", "status": "todo"}], db=self.db, window_minutes=15, parts=1
+        )
         self.assertIn("Running tasks (0):", report)
         self.assertIn("none", report)
 
 
 class BuildStatusTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="flowforge-json-"))
+        self.tmp = temporary_directory(self, "flowforge-json-")
         self.project = self.tmp / "project"
         self.project.mkdir()
         self.runs = self.tmp / "runs"
@@ -176,9 +179,15 @@ class BuildStatusTests(unittest.TestCase):
                     {"id": "t-a", "task_file": "task-a.md", "status": "todo"},
                     {"id": "t-b", "task_file": "task-b.md", "status": "todo"},
                     {"id": "t-c", "task_file": "task-c.md", "status": "done"},
-                    {"id": "t-d", "task_file": "task-a.md", "status": "failed", "session_id": "ses-d"},
+                    {
+                        "id": "t-d",
+                        "task_file": "task-a.md",
+                        "status": "failed",
+                        "session_id": "ses-d",
+                    },
                 ]
-            ) + "\n",
+            )
+            + "\n",
             encoding="utf-8",
         )
         self.steps_file = self.tmp / "steps.json"

@@ -1,11 +1,13 @@
 """Isolate env before pipeline_runner is imported by any test module."""
 
+import atexit
 import os
 import tempfile
 from pathlib import Path
 
-_BASE = Path(tempfile.mkdtemp(prefix="flowforge-tests-"))
-_PROJECT = _BASE / "project"
+_TEMP = tempfile.TemporaryDirectory(prefix="flowforge-tests-")
+atexit.register(_TEMP.cleanup)
+_PROJECT = Path(_TEMP.name) / "project"
 _PROJECT.mkdir(parents=True, exist_ok=True)
 
 os.environ["PROJECT_DIR"] = str(_PROJECT)

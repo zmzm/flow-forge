@@ -8,7 +8,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Callable, Dict, Optional
+from collections.abc import Callable
+from typing import Any
 
 from .base import Notifier
 
@@ -29,7 +30,7 @@ def format_duration(seconds: float) -> str:
     return f"{secs}s"
 
 
-def task_line(task: Dict[str, Any]) -> str:
+def task_line(task: dict[str, Any]) -> str:
     task_id = str(task.get("id") or "-")
     if task.get("project"):
         task_id = f"[{task['project']}] {task_id}"
@@ -46,7 +47,7 @@ class MatrixNotifier(Notifier):
         room_id: str,
         access_token: str,
         timeout_sec: float = DEFAULT_TIMEOUT_SEC,
-        transport: Optional[Callable[[str], None]] = None,
+        transport: Callable[[str], None] | None = None,
     ) -> None:
         self.homeserver = homeserver.rstrip("/")
         self.room_id = room_id
@@ -67,9 +68,9 @@ class MatrixNotifier(Notifier):
             + urllib.parse.quote(self.room_id, safe="")
             + f"/send/m.room.message/{txn_id}"
         )
-        payload = json.dumps(
-            {"msgtype": "m.text", "body": body}, ensure_ascii=False
-        ).encode("utf-8")
+        payload = json.dumps({"msgtype": "m.text", "body": body}, ensure_ascii=False).encode(
+            "utf-8"
+        )
         request = urllib.request.Request(
             url,
             data=payload,
@@ -88,14 +89,14 @@ class MatrixNotifier(Notifier):
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Matrix request failed: {exc.reason}") from exc
 
-    def task_started(self, task: Dict[str, Any]) -> None:
+    def task_started(self, task: dict[str, Any]) -> None:
         lines = ["🔵 FlowForge task started", f"Task: {task_line(task)}"]
         started_at = str(task.get("started_at") or "").strip()
         if started_at:
             lines.append(f"Started: {started_at}")
         self._send("\n".join(lines))
 
-    def task_completed(self, task: Dict[str, Any], result: Dict[str, Any]) -> None:
+    def task_completed(self, task: dict[str, Any], result: dict[str, Any]) -> None:
         lines = ["🟢 FlowForge task completed", f"Task: {task_line(task)}"]
         if result.get("duration_sec") is not None:
             lines.append(f"Duration: {format_duration(float(result['duration_sec']))}")
@@ -104,7 +105,7 @@ class MatrixNotifier(Notifier):
             lines.append(f"Status: {status}")
         self._send("\n".join(lines))
 
-    def task_failed(self, task: Dict[str, Any], error: Dict[str, Any]) -> None:
+    def task_failed(self, task: dict[str, Any], error: dict[str, Any]) -> None:
         lines = ["🔴 FlowForge task failed", f"Task: {task_line(task)}"]
         stage = str(error.get("stage") or "").strip()
         if stage:
@@ -120,7 +121,7 @@ class MatrixNotifier(Notifier):
             lines.append(log_path)
         self._send("\n".join(lines))
 
-    def run_completed(self, summary: Dict[str, Any]) -> None:
+    def run_completed(self, summary: dict[str, Any]) -> None:
         lines = ["🌙 FlowForge run finished"]
         if summary.get("project"):
             lines.append(f"Project: {summary['project']}")
